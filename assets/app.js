@@ -21,6 +21,8 @@ let activeMapContext = null;
 let activeMapData = null;
 let activeMapMetric = "count";
 let pendingShareMapState = null;
+let renderTimer = null;
+let orderCache = {key: "", orders: null};
 const $ = id => document.getElementById(id);
 const fmt = new Intl.NumberFormat('en-US', {maximumFractionDigits: 0});
 const pct = x => "%" + (100*x).toFixed(1);
@@ -79,9 +81,8 @@ const DEFAULT_COLORS = {
   yeniden_refah: "#b1ab06",
   deva_partisi: "#2563eb",
   gelecek_partisi: "#0e7490",
-  evet: "#00c800",
-  hayir: "#a30000",
   diger: "#9e9e9e",
+  katilim: "#64748b",
 };
 const PALETTE_ORDER = [
   "recep_tayyip_erdogan",
@@ -152,6 +153,12 @@ function groupColorFor(token) {
 }
 const colorFor = s => {
   if (/^diger_\d+$/.test(s)) return safeColor(state.colors.diger) || DEFAULT_COLORS.diger;
+  if (isBalanceParty(s)) {
+    return safeColor(state.colors.katilim)
+      || safeColor(state.colors.dengeleme_kaynak)
+      || safeColor(state.colors.dengeleme_hedef)
+      || DEFAULT_COLORS.katilim;
+  }
   const customColor = safeColor(state.colors[s]);
   if (customColor) return customColor;
   const groupColor = groupColorFor(s);
@@ -303,15 +310,18 @@ function init() {
   $('resetView').addEventListener('click', resetView);
   $('sortMode').addEventListener('click', () => {
     pushUndo();
-    state.sortMode = state.sortMode === "vote" ? "flow" : "vote";
+    state.sortMode = state.sortMode === "flow" ? "vote" : "flow";
     Object.values(state.rows).forEach(row => {
       row.order = [];
     });
     render();
   });
-  $('minBox').addEventListener('input', render);
-  $('minRibbon').addEventListener('input', render);
-  $('digerBuckets').addEventListener('input', render);
+  $('minBox').addEventListener('input', () => scheduleRender(120));
+  $('minBox').addEventListener('change', render);
+  $('minRibbon').addEventListener('input', () => scheduleRender(120));
+  $('minRibbon').addEventListener('change', render);
+  $('digerBuckets').addEventListener('input', () => scheduleRender(120));
+  $('digerBuckets').addEventListener('change', render);
   $('showBalance').addEventListener('input', render);
   $('showVotes').addEventListener('input', render);
   $('provinceFilter').addEventListener('input', render);
@@ -507,6 +517,13 @@ function updateUrlState() {
     }
   }, 180);
 }
+function scheduleRender(delay = 80) {
+  window.clearTimeout(renderTimer);
+  renderTimer = window.setTimeout(() => {
+    renderTimer = null;
+    render();
+  }, delay);
+}
 async function shareView() {
   const url = currentShareUrl();
   try {
@@ -537,7 +554,7 @@ function loadSharedView() {
       });
       selectedStageId = state.stages[Math.min(1, state.stages.length - 1)]?.id || null;
     }
-    state.sortMode = payload.m === "flow" ? "flow" : "vote";
+    state.sortMode = payload.m === "flow" || payload.m === "manual" ? payload.m : "vote";
     if (Number.isFinite(+payload.b)) $('minBox').value = +payload.b;
     if (Number.isFinite(+payload.a)) $('minRibbon').value = +payload.a;
     if (Number.isFinite(+payload.d)) $('digerBuckets').value = Math.max(1, Math.min(6, +payload.d));
@@ -636,9 +653,11 @@ function renderColorPalette(nodes = []) {
   [...palette.querySelectorAll('input[type="color"]')].forEach(input => {
     input.addEventListener('input', () => {
       state.colors[input.dataset.party] = input.value;
+      if (isBalanceParty(input.dataset.party)) state.colors.katilim = input.value;
     });
     input.addEventListener('change', () => {
       state.colors[input.dataset.party] = input.value;
+      if (isBalanceParty(input.dataset.party)) state.colors.katilim = input.value;
       render();
     });
   });
@@ -1112,17 +1131,41 @@ function visibleRibbons(links) {
   if (min <= 0) return links;
   return links.filter(link => (+link.estimated_flow_votes || 0) >= min);
 }
+function cloneOrderMap(source) {
+  return new Map([...source.entries()].map(([stageId, group]) => [stageId, group.slice()]));
+}
+function stageOrdersCacheKey(nodes, links, stageTotals, usableW) {
+  const stageBits = state.stages.map(stage => {
+    const row = rowState(stage.id);
+    return [
+      stage.id,
+      stage.key,
+      JSON.stringify(row.hidden || []),
+      JSON.stringify(row.groups || []),
+      state.sortMode === "manual" ? JSON.stringify(row.order || []) : "",
+      Math.round(stageTotals.get(stage.id) || 0),
+    ].join(":");
+  }).join("|");
+  const nodeBits = nodes
+    .map(node => `${node.id}:${Math.round(node.value)}`)
+    .sort()
+    .join("|");
+  const linkBits = links
+    .map(link => `${link.source_node_id}>${link.target_node_id}:${Math.round(+link.estimated_flow_votes || 0)}`)
+    .sort()
+    .join("|");
+  return [state.sortMode, Math.round(usableW), stageBits, nodeBits, linkBits].join("||");
+}
 function stageOrders(nodes, links, stageTotals, usableW) {
   const nodeById = new Map(nodes.map(node => [node.id, node]));
-  const linkedNodeIds = new Set();
+  const directFlow = new Map();
   links.forEach(link => {
-    linkedNodeIds.add(link.source_node_id);
-    linkedNodeIds.add(link.target_node_id);
+    const key = `${link.source_node_id}=>${link.target_node_id}`;
+    directFlow.set(key, (directFlow.get(key) || 0) + (+link.estimated_flow_votes || 0));
   });
-  const manual = new Map();
   const orders = new Map();
   const gap = 1.5;
-  const stageById = new Map(state.stages.map(stage => [stage.id, stage]));
+  const useManualOrder = state.sortMode === "manual";
   state.stages.forEach(stage => {
     const rowOrder = rowState(stage.id).order || [];
     const group = nodes.filter(node => node.stageId === stage.id);
@@ -1130,11 +1173,16 @@ function stageOrders(nodes, links, stageTotals, usableW) {
       const index = rowOrder.indexOf(party);
       return index === -1 ? 10000 : index;
     };
-    group.sort((a, b) => orderIndex(a.party) - orderIndex(b.party) || b.value - a.value);
-    if (rowOrder.length) manual.set(stage.id, true);
+    group.sort((a, b) => (
+      useManualOrder
+        ? orderIndex(a.party) - orderIndex(b.party) || b.value - a.value
+        : b.value - a.value
+    ));
     orders.set(stage.id, group);
   });
   if (state.sortMode !== "flow") return orders;
+  const cacheKey = stageOrdersCacheKey(nodes, links, stageTotals, usableW);
+  if (orderCache.key === cacheKey && orderCache.orders) return cloneOrderMap(orderCache.orders);
   function tokenMembers(stageId, token) {
     if (isDigerToken(token)) return [token];
     const row = rowState(stageId);
@@ -1149,96 +1197,30 @@ function stageOrders(nodes, links, stageTotals, usableW) {
     const shared = aMembers.filter(member => bSet.has(member)).length;
     return shared / Math.max(aMembers.length, bMembers.length, 1);
   }
-  const continuityPairs = [];
-  for (let i = 0; i < nodes.length; i++) {
-    for (let j = i + 1; j < nodes.length; j++) {
-      const a = nodes[i], b = nodes[j];
-      if (a.stageId === b.stageId) continue;
-      const overlap = memberOverlap(a, b);
-      if (!overlap) continue;
-      const aStage = stageById.get(a.stageId);
-      const bStage = stageById.get(b.stageId);
-      const aIndex = state.stages.findIndex(stage => stage.id === a.stageId);
-      const bIndex = state.stages.findIndex(stage => stage.id === b.stageId);
-      const roundTripBoost = aStage && bStage && aStage.key === bStage.key ? 1.6 : 1;
-      const adjacentBoost = Math.abs(aIndex - bIndex) === 1 ? 1.1 : 1;
-      continuityPairs.push({
-        a: a.id,
-        b: b.id,
-        weight: Math.sqrt(Math.min(a.value, b.value)) * Math.sqrt(Math.max(a.value, b.value)) * overlap * roundTripBoost * adjacentBoost,
-      });
-    }
-  }
-  const neighborPairs = [
-    ["ak_parti", "mhp", 0.1],
-    ["mhp", "bbp", 0.035],
-    ["ak_parti", "yeniden_refah", 0.035],
-    ["chp", "iyi_parti", 0.055],
-    ["chp", "dem_star", 0.045],
-    ["dem_star", "tip", 0.035],
-    ["saadet", "deva_partisi", 0.025],
-    ["deva_partisi", "gelecek_partisi", 0.025],
-  ];
-  function containsMember(node, member) {
-    return tokenMembers(node.stageId, node.party).includes(member);
-  }
   function centersFor(candidateOrders) {
     const centers = new Map();
+    const ranks = new Map();
     state.stages.forEach(stage => {
       const group = candidateOrders.get(stage.id) || [];
       const total = stageTotals.get(stage.id) || group.reduce((sum, node) => sum + node.value, 0) || 1;
       const scale = (usableW - Math.max(0, group.length - 1) * gap) / total;
       const visibleW = group.reduce((sum, node) => sum + Math.max(22, node.value * scale), 0) + Math.max(0, group.length - 1) * gap;
       let cursor = Math.max(0, (usableW - visibleW) / 2);
-      group.forEach(node => {
+      group.forEach((node, index) => {
         const boxW = Math.max(22, node.value * scale);
         centers.set(node.id, cursor + boxW / 2);
+        ranks.set(node.id, index);
         cursor += boxW + gap;
       });
     });
-    return centers;
+    return {centers, ranks};
   }
-  function objective(candidateOrders) {
-    const centers = centersFor(candidateOrders);
-    const flowScore = links.reduce((sum, link) => {
-      if (!centers.has(link.source_node_id) || !centers.has(link.target_node_id)) return sum;
-      return sum + (+link.estimated_flow_votes || 0) * Math.abs(centers.get(link.source_node_id) - centers.get(link.target_node_id));
-    }, 0);
-    const continuityScore = continuityPairs.reduce((sum, pair) => {
-      if (!centers.has(pair.a) || !centers.has(pair.b)) return sum;
-      return sum + pair.weight * 0.65 * Math.abs(centers.get(pair.a) - centers.get(pair.b));
-    }, 0);
-    const neighborScore = state.stages.reduce((sum, stage) => {
-      const group = candidateOrders.get(stage.id) || [];
-      for (const [left, right, weight] of neighborPairs) {
-        const a = group.find(node => containsMember(node, left));
-        const b = group.find(node => containsMember(node, right));
-        if (!a || !b || !centers.has(a.id) || !centers.has(b.id)) continue;
-        sum += Math.min(a.value, b.value) * weight * Math.abs(centers.get(a.id) - centers.get(b.id));
-      }
-      return sum;
-    }, 0);
-    return flowScore + continuityScore + neighborScore;
-  }
-  for (let pass = 0; pass < 10; pass++) {
+  for (let pass = 0; pass < 6; pass++) {
     const stages = pass % 2 ? [...state.stages].reverse() : state.stages;
     for (const stage of stages) {
-      if (manual.get(stage.id)) continue;
       const group = orders.get(stage.id) || [];
-      const centers = centersFor(orders);
+      const {centers} = centersFor(orders);
       const weighted = new Map(group.map(node => [node.id, {sum: 0, weight: 0}]));
-      group.forEach(node => {
-        if (!linkedNodeIds.has(node.id)) return;
-        for (const other of nodes) {
-          if (other.stageId === node.stageId || !centers.has(other.id)) continue;
-          const overlap = memberOverlap(node, other);
-          if (!overlap) continue;
-          const priorWeight = Math.sqrt(Math.min(node.value, other.value)) * Math.sqrt(Math.max(node.value, other.value)) * 0.65 * overlap;
-          const item = weighted.get(node.id);
-          item.sum += centers.get(other.id) * priorWeight;
-          item.weight += priorWeight;
-        }
-      });
       links.forEach(link => {
         const source = nodeById.get(link.source_node_id);
         const target = nodeById.get(link.target_node_id);
@@ -1265,30 +1247,175 @@ function stageOrders(nodes, links, stageTotals, usableW) {
       orders.set(stage.id, group);
     }
   }
-  let best = objective(orders);
-  for (const stage of state.stages) {
-    if (manual.get(stage.id)) continue;
-    const group = orders.get(stage.id) || [];
-    let improved = true;
-    while (improved) {
-      improved = false;
-      for (let i = 0; i < group.length - 1; i++) {
-        for (let j = i + 1; j < group.length; j++) {
-          const candidate = new Map(orders);
-          const nextGroup = group.slice();
-          [nextGroup[i], nextGroup[j]] = [nextGroup[j], nextGroup[i]];
-          candidate.set(stage.id, nextGroup);
-          const score = objective(candidate);
-          if (score + 1e-6 < best) {
-            group.splice(0, group.length, ...nextGroup);
-            orders.set(stage.id, group);
-            best = score;
-            improved = true;
-          }
-        }
+  const groupLayoutCache = new Map();
+  function groupCenters(stageId, group) {
+    const cacheKey = `${stageId}::${signature(group)}`;
+    if (groupLayoutCache.has(cacheKey)) return groupLayoutCache.get(cacheKey);
+    const total = stageTotals.get(stageId) || group.reduce((sum, node) => sum + node.value, 0) || 1;
+    const scale = (usableW - Math.max(0, group.length - 1) * gap) / total;
+    const visibleW = group.reduce((sum, node) => sum + Math.max(22, node.value * scale), 0) + Math.max(0, group.length - 1) * gap;
+    let cursor = Math.max(0, (usableW - visibleW) / 2);
+    const centers = new Map();
+    const ranks = new Map();
+    group.forEach((node, index) => {
+      const boxW = Math.max(22, node.value * scale);
+      centers.set(node.id, cursor + boxW / 2);
+      ranks.set(node.id, index);
+      cursor += boxW + gap;
+    });
+    const layout = {centers, ranks};
+    groupLayoutCache.set(cacheKey, layout);
+    return layout;
+  }
+  const adjacentLinks = new Map();
+  links.forEach(link => {
+    const key = `${link.source_stage_id}=>${link.target_stage_id}`;
+    if (!adjacentLinks.has(key)) adjacentLinks.set(key, []);
+    adjacentLinks.get(key).push(link);
+  });
+  const pairCostCache = new Map();
+  function pairCost(sourceStageId, sourceGroup, targetStageId, targetGroup) {
+    const cacheKey = `${sourceStageId}:${signature(sourceGroup)}=>${targetStageId}:${signature(targetGroup)}`;
+    if (pairCostCache.has(cacheKey)) return pairCostCache.get(cacheKey);
+    const source = groupCenters(sourceStageId, sourceGroup);
+    const target = groupCenters(targetStageId, targetGroup);
+    const pairLinks = adjacentLinks.get(`${sourceStageId}=>${targetStageId}`) || [];
+    let score = 0;
+    pairLinks.forEach(link => {
+      if (!source.centers.has(link.source_node_id) || !target.centers.has(link.target_node_id)) return;
+      score += (+link.estimated_flow_votes || 0) * Math.abs(source.centers.get(link.source_node_id) - target.centers.get(link.target_node_id));
+    });
+    for (let i = 0; i < pairLinks.length; i++) {
+      const a = pairLinks[i];
+      const aSourceRank = source.ranks.get(a.source_node_id);
+      const aTargetRank = target.ranks.get(a.target_node_id);
+      if (aSourceRank === undefined || aTargetRank === undefined) continue;
+      for (let j = i + 1; j < pairLinks.length; j++) {
+        const b = pairLinks[j];
+        const bSourceRank = source.ranks.get(b.source_node_id);
+        const bTargetRank = target.ranks.get(b.target_node_id);
+        if (bSourceRank === undefined || bTargetRank === undefined) continue;
+        if ((aSourceRank - bSourceRank) * (aTargetRank - bTargetRank) >= 0) continue;
+        score += Math.sqrt((+a.estimated_flow_votes || 0) * (+b.estimated_flow_votes || 0)) * 6;
       }
     }
+    sourceGroup.forEach(a => {
+      targetGroup.forEach(b => {
+        if (memberOverlap(a, b)) return;
+        const flow = directFlow.get(`${a.id}=>${b.id}`) || 0;
+        const relation = flow / Math.max(Math.min(a.value, b.value), 1);
+        if (relation >= 0.12) return;
+        const weight = Math.sqrt(Math.max(a.value, 0) * Math.max(b.value, 0)) * 0.008 * (1 - relation / 0.12);
+        score -= weight * Math.min(Math.abs(source.centers.get(a.id) - target.centers.get(b.id)), usableW * 0.35);
+      });
+    });
+    pairCostCache.set(cacheKey, score);
+    return score;
   }
+  function signature(group) {
+    return group.map(node => node.party).join(",");
+  }
+  function addCandidate(out, seen, group) {
+    const key = signature(group);
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push(group);
+  }
+  function permutations(items, limit = 720) {
+    const out = [];
+    const used = new Set();
+    const current = [];
+    const walk = () => {
+      if (out.length >= limit) return;
+      if (current.length === items.length) {
+        out.push(current.slice());
+        return;
+      }
+      items.forEach((item, index) => {
+        if (used.has(index)) return;
+        used.add(index);
+        current.push(item);
+        walk();
+        current.pop();
+        used.delete(index);
+      });
+    };
+    walk();
+    return out;
+  }
+  function rowLocalScore(stageIndex, group, referenceOrders) {
+    let score = 0;
+    const stage = state.stages[stageIndex];
+    if (stageIndex > 0) {
+      const prev = state.stages[stageIndex - 1];
+      score += pairCost(prev.id, referenceOrders.get(prev.id) || [], stage.id, group);
+    }
+    if (stageIndex < state.stages.length - 1) {
+      const next = state.stages[stageIndex + 1];
+      score += pairCost(stage.id, group, next.id, referenceOrders.get(next.id) || []);
+    }
+    return score;
+  }
+  function rowCandidates(stage, stageIndex, referenceOrders) {
+    const base = orders.get(stage.id) || [];
+    const seen = new Set();
+    const candidates = [];
+    addCandidate(candidates, seen, base.slice().sort((a, b) => b.value - a.value));
+    addCandidate(candidates, seen, base.slice().sort((a, b) => partyFlowRank(a.party) - partyFlowRank(b.party) || b.value - a.value));
+    addCandidate(candidates, seen, base.slice());
+    for (let from = 0; from < base.length; from++) {
+      for (let to = 0; to < base.length; to++) {
+        if (from === to) continue;
+        const next = base.slice();
+        const [item] = next.splice(from, 1);
+        next.splice(to, 0, item);
+        addCandidate(candidates, seen, next);
+      }
+    }
+    const total = stageTotals.get(stage.id) || 1;
+    const large = base.filter(node => node.value / total >= 0.075 || base.indexOf(node) < 6);
+    if (large.length > 1 && large.length <= 6) {
+      permutations(large).forEach(order => {
+        let cursor = 0;
+        const next = base.map(node => large.includes(node) ? order[cursor++] : node);
+        addCandidate(candidates, seen, next);
+      });
+    }
+    return candidates
+      .map(group => ({group, score: rowLocalScore(stageIndex, group, referenceOrders)}))
+      .sort((a, b) => a.score - b.score || signature(a.group).localeCompare(signature(b.group)))
+      .slice(0, 96)
+      .map(item => item.group);
+  }
+  const candidateRows = state.stages.map((stage, index) => rowCandidates(stage, index, orders));
+  const dp = candidateRows.map(row => row.map(() => ({score: Number.POSITIVE_INFINITY, prev: -1})));
+  candidateRows[0].forEach((_, index) => {
+    dp[0][index].score = 0;
+  });
+  for (let si = 1; si < state.stages.length; si++) {
+    const prevStage = state.stages[si - 1];
+    const stage = state.stages[si];
+    candidateRows[si].forEach((group, gi) => {
+      candidateRows[si - 1].forEach((prevGroup, pi) => {
+        const score = dp[si - 1][pi].score + pairCost(prevStage.id, prevGroup, stage.id, group);
+        if (score < dp[si][gi].score) {
+          dp[si][gi] = {score, prev: pi};
+        }
+      });
+    });
+  }
+  let bestIndex = 0;
+  const last = dp.length - 1;
+  dp[last].forEach((item, index) => {
+    if (item.score < dp[last][bestIndex].score) bestIndex = index;
+  });
+  for (let si = last; si >= 0; si--) {
+    const stage = state.stages[si];
+    orders.set(stage.id, candidateRows[si][bestIndex].slice());
+    bestIndex = dp[si][bestIndex].prev;
+    if (bestIndex < 0 && si > 0) bestIndex = 0;
+  }
+  orderCache = {key: cacheKey, orders: cloneOrderMap(orders)};
   return orders;
 }
 function layoutNodes(links, baselineLinks = links, standaloneNodes = []) {
@@ -1423,6 +1550,7 @@ function sortNode(source, target, after) {
   const targetIndex = without.indexOf(target.party);
   without.splice(targetIndex + (after ? 1 : 0), 0, source.party);
   row.order = [...new Set(without)];
+  state.sortMode = "manual";
   selectedStageId = target.stageId;
   selectedNode = source;
   render();
@@ -2183,6 +2311,10 @@ function draw(rawLinks, baselineLinks = rawLinks, standaloneNodes = []) {
   });
 }
 async function render() {
+  if (renderTimer) {
+    window.clearTimeout(renderTimer);
+    renderTimer = null;
+  }
   const seq = ++renderSeq;
   updateUrlState();
   setLoading(true);
