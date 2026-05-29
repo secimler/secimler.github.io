@@ -1,0 +1,48 @@
+export function decodeFlowBinary(buffer, provinces = []) {
+  const view = new DataView(buffer);
+  const magic = String.fromCharCode(...new Uint8Array(buffer, 0, 4));
+  if (magic !== "EIF1") throw new Error("bad flow binary magic");
+  const headerLength = view.getUint32(4, true);
+  const headerBytes = new Uint8Array(buffer, 8, headerLength);
+  const header = JSON.parse(new TextDecoder().decode(headerBytes));
+  let offset = 8 + headerLength;
+  const rows = [];
+  const hasProvince = !!header.province;
+  const provinceNames = header.provinces || provinces;
+  for (let i = 0; i < header.row_count; i++) {
+    let il = "";
+    if (hasProvince) {
+      il = provinceNames[view.getUint16(offset, true)];
+      offset += 2;
+    }
+    const source = header.source_parties[view.getUint16(offset, true)];
+    const target = header.target_parties[view.getUint16(offset + 2, true)];
+    offset += 4;
+    const sourceVotes = view.getFloat64(offset, true); offset += 8;
+    const sourceObservedVotes = view.getFloat64(offset, true); offset += 8;
+    const targetVotes = view.getFloat64(offset, true); offset += 8;
+    const flow = view.getFloat64(offset, true); offset += 8;
+    const probability = view.getFloat64(offset, true); offset += 8;
+    const targetShare = view.getFloat64(offset, true); offset += 8;
+    rows.push({
+      ...(hasProvince ? {il} : {}),
+      pair_key: header.pair_key,
+      source_key: header.source_key,
+      target_key: header.target_key,
+      model: header.model,
+      source_party: source,
+      target_party: target,
+      source_votes: sourceVotes,
+      source_observed_votes: sourceObservedVotes,
+      target_votes: targetVotes,
+      estimated_flow_votes: flow,
+      transition_probability: probability,
+      source_share_of_row: probability,
+      target_share_of_column: targetShare,
+      source_node_id: `${header.source_key}::${source}`,
+      target_node_id: `${header.target_key}::${target}`,
+      direction: header.direction || "directed",
+    });
+  }
+  return rows;
+}
