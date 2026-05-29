@@ -1203,7 +1203,7 @@ function layoutNodes(links, baselineLinks = links, standaloneNodes = []) {
     const availableNodeW = usableW - Math.max(0, group.length - 1) * gap;
     const rawWidths = group.map(n => Math.max(minNodeW, n.value * scale));
     const rawTotal = rawWidths.reduce((sum, value) => sum + value, 0) || 1;
-    const fitScale = mobile ? Math.min(1, availableNodeW / rawTotal) : 1;
+    const fitScale = Math.min(1, availableNodeW / rawTotal);
     const widths = rawWidths.map(value => value * fitScale);
     const visibleW = widths.reduce((sum, value) => sum + value, 0) + Math.max(0, group.length - 1) * gap;
     let cursor = labelW + Math.max(0, (usableW - visibleW) / 2);
