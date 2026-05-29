@@ -348,6 +348,7 @@ function init() {
   $('showVotes').addEventListener('input', () => { commitHistoryEdit(); render(); });
   $('provinceFilter').addEventListener('input', () => { commitHistoryEdit(); render(); });
   $('shareView').addEventListener('click', shareView);
+  $('shareMap').addEventListener('click', shareMap);
   $('hoverInfo').addEventListener('click', event => {
     if (event.target.closest('#openMap')) openMap(activeMapContext);
   });
@@ -615,6 +616,19 @@ async function shareView() {
     window.setTimeout(() => $('shareView').textContent = "Paylaş", 1200);
   } catch (error) {
     window.prompt("Paylaşım bağlantısı", url);
+  }
+}
+async function shareMap() {
+  updateUrlState();
+  const url = currentShareUrl();
+  const button = $('shareMap');
+  try {
+    await navigator.clipboard.writeText(url);
+    const old = button.textContent;
+    button.textContent = "✓";
+    window.setTimeout(() => button.textContent = old, 1200);
+  } catch (error) {
+    window.prompt("Harita bağlantısı", url);
   }
 }
 function loadSharedView() {

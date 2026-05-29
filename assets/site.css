@@ -109,6 +109,7 @@ body.drag-active #chart { touch-action:none; }
 .map-metric { flex:0 0 auto; display:flex; gap:3px; padding:3px; border:1px solid #8fa0b5; border-radius:6px; background:#f8fafc; }
 .map-metric button { width:32px; height:28px; padding:0; border:1px solid transparent; border-radius:4px; background:white; color:#1f2937; font-size:14px; font-weight:900; }
 .map-metric button.active { background:#0f766e; color:white; }
+.map-icon-button { width:34px; flex:0 0 34px; padding:0; font-size:18px; line-height:1; }
 .map-close { width:34px; flex:0 0 34px; padding:0; }
 .map-body { min-height:0; display:grid; grid-template-rows:auto minmax(0,1fr); align-content:start; overflow:hidden; }
 .map-chart { display:block; width:100%; height:auto; min-height:0; max-height:calc(100vh - 280px); aspect-ratio:var(--map-aspect, 2.2); background:#f8fafc; }
