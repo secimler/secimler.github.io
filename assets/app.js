@@ -5,6 +5,7 @@ const DATA = JSON.parse(document.getElementById('ei-data').textContent);
 const flowPromises = {};
 const provinceFlowPromises = {};
 const DEFAULT_MODEL_PRIORITY = [
+  "balanced_forward_bayes",
   "balanced_forward_bayes_2023_mv_cb",
   "joint_margin_balanced",
   "province_penalty_reciprocal_prior",
@@ -518,13 +519,22 @@ function hiddenChips(stage) {
 }
 function colorPaletteParties(nodes = []) {
   const visible = new Set(nodes.map(node => node.party).filter(Boolean));
-  return [...visible]
+  const byLabel = new Map();
+  [...visible].forEach(party => {
+    const label = labelFor(party);
+    const existing = byLabel.get(label);
+    if (!existing || colorPaletteRank(party) < colorPaletteRank(existing)) byLabel.set(label, party);
+  });
+  return [...byLabel.values()]
     .sort((a, b) => {
-      const ai = PALETTE_ORDER.indexOf(a);
-      const bi = PALETTE_ORDER.indexOf(b);
+      const ai = colorPaletteRank(a);
+      const bi = colorPaletteRank(b);
       if (ai !== -1 || bi !== -1) return (ai === -1 ? 10000 : ai) - (bi === -1 ? 10000 : bi);
       return labelFor(a).localeCompare(labelFor(b));
     });
+}
+function colorPaletteRank(party) {
+  return PALETTE_ORDER.indexOf(party);
 }
 function renderColorPalette(nodes = []) {
   const palette = $('colorPalette');
@@ -1473,10 +1483,11 @@ function draw(rawLinks, baselineLinks = rawLinks, standaloneNodes = []) {
     const hover = describeNode(label, n.value, share);
     const rotated = n.w < 52;
     const compact = n.w < (mobile ? 44 : 64);
+    const showPct = val && !compact && !rotated;
     const labelText = rotated
       ? `<text class="node-label rotated" transform="translate(${n.x + n.w/2} ${n.y + n.h/2}) rotate(-90)" text-anchor="middle">${text(label)}</text>`
-      : `<text class="node-label" x="${n.x + n.w/2}" y="${n.y + (val && !compact ? n.h/2 - 8 : n.h/2 + 6)}" text-anchor="middle">${text(label)}</text>`;
-    const pctText = val && !compact ? `<text class="node-pct" x="${n.x + n.w/2}" y="${n.y + n.h/2 + 17}" text-anchor="middle">${text(val)}</text>` : '';
+      : `<text class="node-label" x="${n.x + n.w/2}" y="${n.y + (showPct ? n.h/2 - 8 : n.h/2 + 6)}" text-anchor="middle">${text(label)}</text>`;
+    const pctText = showPct ? `<text class="node-pct" x="${n.x + n.w/2}" y="${n.y + n.h/2 + 17}" text-anchor="middle">${text(val)}</text>` : '';
     const selected = selectedNode && selectedNode.stageId === n.stageId && selectedNode.party === n.party;
     const dim = selectedKey && !connected.nodes.has(n.id);
     const row = rowState(n.stageId);
