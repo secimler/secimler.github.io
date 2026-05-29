@@ -46,3 +46,45 @@ export function decodeFlowBinary(buffer, provinces = []) {
   }
   return rows;
 }
+
+export function decodeIlceVoteBinary(buffer) {
+  const view = new DataView(buffer);
+  const magic = String.fromCharCode(...new Uint8Array(buffer, 0, 4));
+  if (magic !== "EIV1") throw new Error("bad ilce vote binary magic");
+  const headerLength = view.getUint32(4, true);
+  const headerBytes = new Uint8Array(buffer, 8, headerLength);
+  const header = JSON.parse(new TextDecoder().decode(headerBytes));
+  let offset = 8 + headerLength;
+  const sourceCount = header.source_parties.length;
+  const targetCount = header.target_parties.length;
+  const rows = [];
+  for (let i = 0; i < header.row_count; i++) {
+    const district = header.districts[view.getUint16(offset, true)];
+    offset += 2;
+    const sourceTotal = view.getFloat32(offset, true); offset += 4;
+    const targetTotal = view.getFloat32(offset, true); offset += 4;
+    const sourceVotes = {};
+    for (let s = 0; s < sourceCount; s++) {
+      sourceVotes[header.source_parties[s]] = view.getFloat32(offset, true);
+      offset += 4;
+    }
+    const targetVotes = {};
+    for (let t = 0; t < targetCount; t++) {
+      targetVotes[header.target_parties[t]] = view.getFloat32(offset, true);
+      offset += 4;
+    }
+    rows.push({
+      il: district.il,
+      ilce: district.ilce,
+      source_total: sourceTotal,
+      target_total: targetTotal,
+      source_votes: sourceVotes,
+      target_votes: targetVotes,
+    });
+  }
+  return {
+    sourceParties: header.source_parties,
+    targetParties: header.target_parties,
+    rows,
+  };
+}

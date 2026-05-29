@@ -1,9 +1,11 @@
-import {decodeFlowBinary} from "./flow-binary.js";
+import {decodeFlowBinary, decodeIlceVoteBinary} from "./flow-binary.js";
 import {decodeSharePayload, encodeSharePayload} from "./share-state.js";
 
 const DATA = JSON.parse(document.getElementById('ei-data').textContent);
 const flowPromises = {};
 const provinceFlowPromises = {};
+const ilceVotePromises = {};
+let ilceGeometryPromise = null;
 const DEFAULT_MODEL_PRIORITY = [
   "balanced_forward_bayes",
   "balanced_forward_bayes_2023_mv_cb",
@@ -14,15 +16,24 @@ const DEFAULT_MODEL_PRIORITY = [
 ];
 let renderSeq = 0;
 let lastDragEndedAt = 0;
+let activeMapContext = null;
+let activeMapData = null;
+let activeMapMetric = "count";
 const $ = id => document.getElementById(id);
 const fmt = new Intl.NumberFormat('en-US', {maximumFractionDigits: 0});
 const pct = x => "%" + (100*x).toFixed(1);
 const million = x => (x / 1000000).toFixed(1) + "M";
 const text = value => String(value).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
 const attr = value => text(value).replaceAll('"', "&quot;");
-const hoverLine = text => {
+const hoverLine = (message, mapContext = null) => {
   const el = $('hoverInfo');
-  if (el) el.textContent = text || "";
+  activeMapContext = mapContext;
+  if (!el) return;
+  if (!message) {
+    el.textContent = "";
+    return;
+  }
+  el.innerHTML = `<span class="hover-text">${text(message)}</span>${mapContext ? '<button id="openMap" type="button" class="ghost-button hover-map">Harita</button>' : ''}`;
 };
 function svgMessage(message, detail = "") {
   const svg = $('chart');
@@ -87,6 +98,7 @@ let dragStageInsert = null;
 let dragNode = null;
 let selectedStageId = null;
 let selectedNode = null;
+let selectedLinkKey = null;
 const undoStack = [];
 let urlTimer = null;
 let resizeTimer = null;
@@ -297,11 +309,43 @@ function init() {
   $('showVotes').addEventListener('input', render);
   $('provinceFilter').addEventListener('input', render);
   $('shareView').addEventListener('click', shareView);
+  $('hoverInfo').addEventListener('click', event => {
+    if (event.target.closest('#openMap')) openMap(activeMapContext);
+  });
+  $('closeMap').addEventListener('click', closeMap);
+  $('mapMetric').addEventListener('click', event => {
+    const button = event.target.closest('button[data-metric]');
+    if (!button || !activeMapData) return;
+    activeMapMetric = button.dataset.metric;
+    updateMapMetricControls(activeMapData.context);
+    renderMap(
+      activeMapData.context,
+      activeMapData.geometry,
+      mapRowsForContext(activeMapData.context, activeMapData.votes, activeMapData.provinceRows, activeMapMetric),
+      activeMapMetric,
+    );
+  });
+  $('mapModal').addEventListener('click', event => {
+    if (event.target === $('mapModal')) closeMap();
+  });
+  window.addEventListener('keydown', event => {
+    if (event.key === "Escape" && !$('mapModal').hidden) closeMap();
+  });
   $('chart').addEventListener('contextmenu', event => event.preventDefault());
   $('chart').addEventListener('selectstart', event => event.preventDefault());
   window.addEventListener('resize', () => {
     window.clearTimeout(resizeTimer);
-    resizeTimer = window.setTimeout(render, 120);
+    resizeTimer = window.setTimeout(() => {
+      render();
+      if (activeMapData && !$('mapModal').hidden) {
+        renderMap(
+          activeMapData.context,
+          activeMapData.geometry,
+          mapRowsForContext(activeMapData.context, activeMapData.votes, activeMapData.provinceRows, activeMapMetric),
+          activeMapMetric,
+        );
+      }
+    }, 120);
   });
   $('collapseSidebar').addEventListener('click', () => {
     document.body.classList.toggle('sidebar-collapsed');
@@ -377,6 +421,7 @@ function resetView() {
   state.sortMode = "vote";
   state.colors = {};
   selectedNode = null;
+  selectedLinkKey = null;
   if (!stageIds.has(selectedStageId)) selectedStageId = state.stages[0]?.id || null;
   setDefaultControls();
   render();
@@ -700,6 +745,37 @@ async function ensureProvincePairModel(pairKey, model) {
     });
   }
   await provinceFlowPromises[promiseKey];
+}
+async function loadIlceVotes(pairKey, model) {
+  const cached = DATA.ilce_votes?.[pairKey]?.[model];
+  if (cached) return cached;
+  const path = DATA.ilce_vote_files?.[pairKey]?.[model];
+  if (!path) throw dataUnavailable(`missing district vote data for ${pairKey} (${model})`);
+  const promiseKey = `${pairKey}::${model}`;
+  if (!ilceVotePromises[promiseKey]) {
+    ilceVotePromises[promiseKey] = fetch(path).then(async response => {
+      if (!response.ok) throw new Error(`failed to load ${path}`);
+      const decoded = decodeIlceVoteBinary(await response.arrayBuffer());
+      DATA.ilce_votes = DATA.ilce_votes || {};
+      DATA.ilce_votes[pairKey] = DATA.ilce_votes[pairKey] || {};
+      DATA.ilce_votes[pairKey][model] = decoded;
+      return decoded;
+    }).catch(error => {
+      delete ilceVotePromises[promiseKey];
+      throw error;
+    });
+  }
+  return ilceVotePromises[promiseKey];
+}
+async function loadIlceGeometry() {
+  if (!DATA.maps?.ilce) throw dataUnavailable("missing district map geometry");
+  if (!ilceGeometryPromise) {
+    ilceGeometryPromise = fetch(DATA.maps.ilce).then(async response => {
+      if (!response.ok) throw new Error(`failed to load ${DATA.maps.ilce}`);
+      return response.json();
+    });
+  }
+  return ilceGeometryPromise;
 }
 function bestModelForPair(pairKey) {
   const summary = DATA.cv_summaries[pairKey] || [];
@@ -1337,6 +1413,349 @@ function describeLink(d, valueText, sourceLabel = labelFor(d.source_party), targ
 function describeNode(label, votes, share) {
   return `${label}: ${fmt.format(votes)} oy, ${pct(share)}`;
 }
+function stageForId(stageId) {
+  return state.stages.find(stage => stage.id === stageId);
+}
+function tokenMemberParties(stageId, token, rawLinks = []) {
+  const row = rowState(stageId);
+  const members = membersForToken(row, token);
+  return [...new Set(members.flatMap(member => (
+    isDigerToken(member) ? digerMemberParties(stageId, member, rawLinks) : [member]
+  )))];
+}
+function mapPartyTotals(rawLinks) {
+  const sideTotals = new Map();
+  for (const d of rawLinks) {
+    if (d.source_stage_id) {
+      sideTotals.set(`${d.source_stage_id}::source::${d.source_party}`, (sideTotals.get(`${d.source_stage_id}::source::${d.source_party}`) || 0) + (+d.estimated_flow_votes || 0));
+    }
+    if (d.target_stage_id) {
+      sideTotals.set(`${d.target_stage_id}::target::${d.target_party}`, (sideTotals.get(`${d.target_stage_id}::target::${d.target_party}`) || 0) + (+d.estimated_flow_votes || 0));
+    }
+  }
+  const totals = new Map();
+  for (const [key, value] of sideTotals.entries()) {
+    const [stageId, , party] = key.split("::");
+    const totalKey = `${stageId}::${party}`;
+    totals.set(totalKey, Math.max(totals.get(totalKey) || 0, value));
+  }
+  return totals;
+}
+function digerMemberParties(stageId, token, rawLinks) {
+  const stage = stageForId(stageId);
+  if (!stage || !rawLinks.length) return [];
+  const totals = mapPartyTotals(rawLinks);
+  const digerBuckets = digerBucketMap(rawLinks, totals);
+  const row = rowState(stageId);
+  return [...totals.entries()]
+    .filter(([key]) => key.startsWith(`${stageId}::`))
+    .map(([key]) => key.split("::")[1])
+    .filter(party => !isBalanceParty(party))
+    .filter(party => !row.hidden.includes(party))
+    .filter(party => visibleParty(stage, party, totals, false, digerBuckets) === token);
+}
+function mapContextForLink(link) {
+  const sourceStage = stageForId(link.source_stage_id);
+  const targetStage = stageForId(link.target_stage_id);
+  if (!sourceStage || !targetStage) return null;
+  const pairKey = `${sourceStage.key}__to__${targetStage.key}`;
+  const model = bestModelForPair(pairKey);
+  if (!DATA.ilce_vote_files?.[pairKey]?.[model] || !DATA.maps?.ilce) return null;
+  const rows = pairLinks(pairKey, model).map(row => ({
+    ...row,
+    source_stage_id: link.source_stage_id,
+    target_stage_id: link.target_stage_id,
+  }));
+  return {
+    kind: "flow",
+    pairKey,
+    model,
+    sourceStageId: link.source_stage_id,
+    targetStageId: link.target_stage_id,
+    sourceParties: tokenMemberParties(link.source_stage_id, link.source_party, rows),
+    targetParties: tokenMemberParties(link.target_stage_id, link.target_party, rows),
+    title: `${labelFor(link.source_party)} -> ${labelFor(link.target_party)}`,
+    subtitle: `${stageLabel(sourceStage.key)} -> ${stageLabel(targetStage.key)}`,
+  };
+}
+function mapContextForNode(node) {
+  const stage = stageForId(node.stageId);
+  if (!stage) return null;
+  const pair = adjacentPairForStage(stage.key);
+  if (!pair) return null;
+  const model = bestModelForPair(pair.pair_key);
+  if (!DATA.ilce_vote_files?.[pair.pair_key]?.[model] || !DATA.maps?.ilce) return null;
+  const side = pair.source.key === stage.key ? "source" : "target";
+  const sourceStageId = stageIdForKey(pair.source.key) || (side === "source" ? node.stageId : "__map_source");
+  const targetStageId = stageIdForKey(pair.target.key) || (side === "target" ? node.stageId : "__map_target");
+  const rows = pairLinks(pair.pair_key, model).map(row => ({
+    ...row,
+    source_stage_id: sourceStageId,
+    target_stage_id: targetStageId,
+  }));
+  return {
+    kind: "party",
+    pairKey: pair.pair_key,
+    model,
+    side,
+    stageId: node.stageId,
+    parties: tokenMemberParties(node.stageId, node.party, rows),
+    title: labelFor(node.party),
+    subtitle: stageLabel(stage.key),
+  };
+}
+function districtKey(il, ilce) {
+  return `${locationKey(il)}::${locationKey(ilce)}`;
+}
+function locationKey(value) {
+  return String(value || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replaceAll("İ", "I")
+    .replaceAll("ı", "I")
+    .toUpperCase()
+    .replace(/\s+/g, " ")
+    .trim();
+}
+function transitionAt(provinceRows, province, sourceParty, targetParty) {
+  const row = provinceRows.find(item =>
+    item.il === province &&
+    item.source_party === sourceParty &&
+    item.target_party === targetParty
+  );
+  return +(row?.transition_probability || 0);
+}
+function nationalFlowTransition(context) {
+  const rows = pairLinks(context.pairKey, context.model);
+  let numerator = 0;
+  let denominator = 0;
+  context.sourceParties.forEach(sourceParty => {
+    const sourceRows = rows.filter(row => row.source_party === sourceParty);
+    const sourceTotal = Math.max(...sourceRows.map(row => +row.source_votes || 0), 0);
+    denominator += sourceTotal;
+    context.targetParties.forEach(targetParty => {
+      const flow = sourceRows.find(row => row.target_party === targetParty);
+      numerator += +flow?.estimated_flow_votes || 0;
+    });
+  });
+  return denominator > 0 ? numerator / denominator : 0;
+}
+function nationalPartyShare(context, votes) {
+  const source = context.side === "source";
+  let numerator = 0;
+  let denominator = 0;
+  votes.rows.forEach(row => {
+    const voteMap = source ? row.source_votes : row.target_votes;
+    numerator += context.parties.reduce((sum, party) => sum + (+voteMap[party] || 0), 0);
+    denominator += source ? row.source_total : row.target_total;
+  });
+  return denominator > 0 ? numerator / denominator : 0;
+}
+function flowTransitionValue(context, province, provinceRows) {
+  let numerator = 0;
+  let denominator = 0;
+  context.sourceParties.forEach(sourceParty => {
+    const sourceRows = provinceRows.filter(row => row.il === province && row.source_party === sourceParty);
+    const sourceVotes = sourceRows.length ? Math.max(...sourceRows.map(row => +row.source_votes || 0), 0) : 0;
+    denominator += sourceVotes;
+    context.targetParties.forEach(targetParty => {
+      numerator += sourceVotes * transitionAt(provinceRows, province, sourceParty, targetParty);
+    });
+  });
+  return denominator > 0 ? numerator / denominator : 0;
+}
+function mapRowsForContext(context, votes, provinceRows = [], metric = "count") {
+  const baseline = metric === "share"
+    ? nationalPartyShare(context, votes)
+    : metric === "transition"
+      ? nationalFlowTransition(context)
+      : 0;
+  return votes.rows.map(row => {
+    let value = 0;
+    if (context.kind === "party") {
+      const source = context.side === "source";
+      const voteMap = source ? row.source_votes : row.target_votes;
+      const count = context.parties.reduce((sum, party) => sum + (+voteMap[party] || 0), 0);
+      const total = source ? row.source_total : row.target_total;
+      value = metric === "share" ? count / Math.max(total, 1) : count;
+    } else {
+      if (metric === "transition") {
+        value = flowTransitionValue(context, row.il, provinceRows);
+      } else {
+        const scale = row.source_total > 0 ? row.target_total / row.source_total : 0;
+        context.sourceParties.forEach(sourceParty => {
+          const sourceVotes = +row.source_votes[sourceParty] || 0;
+          context.targetParties.forEach(targetParty => {
+            value += sourceVotes * transitionAt(provinceRows, row.il, sourceParty, targetParty) * scale;
+          });
+        });
+      }
+    }
+    const colorValue = metric === "share" || metric === "transition" ? value - baseline : value;
+    return {...row, value, colorValue, baseline};
+  }).filter(row => row.value > 0).sort((a, b) => b.value - a.value);
+}
+function featureCoordinates(geometry) {
+  if (!geometry) return [];
+  if (geometry.type === "Polygon") return geometry.coordinates.flat(1);
+  if (geometry.type === "MultiPolygon") return geometry.coordinates.flat(2);
+  return [];
+}
+function geoPath(geometry, project) {
+  const ringPath = ring => ring.map((point, index) => {
+    const [x, y] = project(point);
+    return `${index ? "L" : "M"}${x.toFixed(1)} ${y.toFixed(1)}`;
+  }).join(" ") + " Z";
+  if (geometry.type === "Polygon") return geometry.coordinates.map(ringPath).join(" ");
+  if (geometry.type === "MultiPolygon") return geometry.coordinates.flatMap(poly => poly.map(ringPath)).join(" ");
+  return "";
+}
+function mapColor(value, maxValue) {
+  if (!value || !maxValue) return "#e5e7eb";
+  const t = Math.max(0, Math.min(1, Math.log1p(value) / Math.log1p(maxValue)));
+  const start = [236, 253, 245];
+  const end = [15, 118, 110];
+  return rgbToHex(start.map((channel, index) => channel + (end[index] - channel) * t));
+}
+function mapDivergingColor(value, maxAbs) {
+  if (!maxAbs) return "#f8fafc";
+  const t = Math.max(0, Math.min(1, Math.abs(value) / maxAbs));
+  const neutral = [248, 250, 252];
+  const end = value >= 0 ? [22, 163, 74] : [220, 38, 38];
+  return rgbToHex(neutral.map((channel, index) => channel + (end[index] - channel) * t));
+}
+function metricLabel(context, metric) {
+  if (metric === "share") return "Oy oranı";
+  if (metric === "transition") return "Geçiş oranı";
+  return "Oy sayısı";
+}
+function formatMapValue(context, metric, value) {
+  return metric === "share" || metric === "transition" ? pct(value) : fmt.format(value);
+}
+function formatSignedPct(value) {
+  const sign = value > 0 ? "+" : "";
+  return `${sign}${pct(value)}`;
+}
+function formatSignedPp(value) {
+  const sign = value > 0 ? "+" : "";
+  return `${sign}${(100 * value).toFixed(1)} pp`;
+}
+function mapDisplayRows(context, rows, metric) {
+  if (context.kind !== "flow" || metric !== "transition") return rows;
+  const byProvince = new Map();
+  rows.forEach(row => {
+    if (!byProvince.has(row.il)) byProvince.set(row.il, {...row, ilce: ""});
+  });
+  return [...byProvince.values()].sort((a, b) => b.value - a.value || a.il.localeCompare(b.il, "tr"));
+}
+function mapRowLabel(row, provinceOnly = false) {
+  return provinceOnly ? row.il : `${row.il} / ${row.ilce}`;
+}
+function mapListKey(row, provinceOnly = false) {
+  return provinceOnly ? locationKey(row.il) : districtKey(row.il, row.ilce);
+}
+function focusMapRow(key) {
+  const row = $('mapRows').querySelector(`[data-map-row-key="${CSS.escape(key)}"]`);
+  if (!row) return;
+  $('mapRows').querySelectorAll('.map-row.selected').forEach(item => item.classList.remove('selected'));
+  row.classList.add('selected');
+  row.scrollIntoView({block: "center", behavior: "smooth"});
+}
+function updateMapMetricControls(context) {
+  const options = context.kind === "flow"
+    ? [["count", "#"], ["transition", "%"]]
+    : [["count", "#"], ["share", "%"]];
+  if (!options.some(([metric]) => metric === activeMapMetric)) activeMapMetric = "count";
+  $('mapMetric').innerHTML = options.map(([metric, label]) => (
+    `<button type="button" class="${metric === activeMapMetric ? 'active' : ''}" data-metric="${attr(metric)}">${text(label)}</button>`
+  )).join("");
+}
+function renderMap(context, geometry, rows, metric = "count") {
+  const svg = $('mapChart');
+  const allPoints = geometry.features.flatMap(feature => featureCoordinates(feature.geometry));
+  const xs = allPoints.map(point => point[0]);
+  const ys = allPoints.map(point => point[1]);
+  const minX = Math.min(...xs), maxX = Math.max(...xs);
+  const minY = Math.min(...ys), maxY = Math.max(...ys);
+  svg.style.setProperty("--map-aspect", String((maxX - minX) / Math.max(maxY - minY, 0.0001)));
+  const box = svg.getBoundingClientRect();
+  const width = Math.max(box.width || svg.clientWidth || 760, 320);
+  const height = Math.max(box.height || svg.clientHeight || 520, 80);
+  svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+  const pad = 14;
+  const scale = Math.min((width - pad * 2) / (maxX - minX), (height - pad * 2) / (maxY - minY));
+  const project = point => [
+    pad + (point[0] - minX) * scale,
+    height - pad - (point[1] - minY) * scale,
+  ];
+  const values = new Map(rows.map(row => [districtKey(row.il, row.ilce), row.value]));
+  const colorValues = new Map(rows.map(row => [districtKey(row.il, row.ilce), row.colorValue]));
+  const maxValue = rows[0]?.value || 0;
+  const contrast = metric === "share" || metric === "transition";
+  const provinceOnly = context.kind === "flow" && metric === "transition";
+  const maxAbs = Math.max(...rows.map(row => Math.abs(row.colorValue || 0)), 0);
+  svg.innerHTML = geometry.features.map(feature => {
+    const props = feature.properties || {};
+    const key = districtKey(props.il, props.ilce);
+    const rowKey = provinceOnly ? locationKey(props.il) : key;
+    const value = values.get(key) || 0;
+    const colorValue = colorValues.get(key) || 0;
+    const klass = value ? "map-district" : "map-district empty";
+    const fill = contrast ? mapDivergingColor(colorValue, maxAbs) : mapColor(value, maxValue);
+    const title = contrast
+      ? `${props.il} / ${props.ilce}: ${formatMapValue(context, metric, value)} (${formatSignedPp(colorValue)})`
+      : `${props.il} / ${props.ilce}: ${formatMapValue(context, metric, value)}`;
+    return `<path class="${klass}" d="${geoPath(feature.geometry, project)}" fill="${fill}" data-map-row-key="${attr(rowKey)}"><title>${text(title)}</title></path>`;
+  }).join("");
+  svg.querySelectorAll('.map-district:not(.empty)').forEach(path => {
+    path.addEventListener('click', () => focusMapRow(path.dataset.mapRowKey));
+  });
+  $('mapTitle').textContent = context.title;
+  $('mapSubtitle').textContent = context.subtitle;
+  $('mapLegend').textContent = rows.length
+    ? contrast
+      ? `${metricLabel(context, metric)} - ulusal ${formatMapValue(context, metric, rows[0].baseline || 0)}; kırmızı altı, yeşil üstü`
+      : `${metricLabel(context, metric)} - en yüksek: ${rows[0].il} / ${rows[0].ilce} - ${formatMapValue(context, metric, rows[0].value)}`
+    : "Veri yok";
+  const displayRows = mapDisplayRows(context, rows, metric);
+  $('mapRows').innerHTML = displayRows.map(row => (
+    `<div class="map-row" data-map-row-key="${attr(mapListKey(row, provinceOnly))}"><span>${text(mapRowLabel(row, provinceOnly))}</span><strong>${formatMapValue(context, metric, row.value)}${contrast ? ` (${formatSignedPp(row.colorValue)})` : ""}</strong></div>`
+  )).join("");
+}
+async function openMap(context) {
+  if (!context) return;
+  $('mapModal').hidden = false;
+  $('mapTitle').textContent = context.title;
+  $('mapSubtitle').textContent = "Yükleniyor...";
+  $('mapChart').innerHTML = "";
+  $('mapLegend').textContent = "";
+  $('mapRows').textContent = "";
+  activeMapMetric = context.kind === "flow" ? "transition" : "share";
+  updateMapMetricControls(context);
+  try {
+    const loaders = [
+      loadIlceVotes(context.pairKey, context.model),
+      loadIlceGeometry(),
+    ];
+    if (context.kind === "flow") {
+      loaders.push(ensureProvincePairModel(context.pairKey, context.model));
+      loaders.push(ensurePairModel(context.pairKey, context.model));
+    }
+    const [votes, geometry] = await Promise.all(loaders);
+    const provinceRows = context.kind === "flow"
+      ? provincePairLinks(context.pairKey, context.model, "")
+      : [];
+    activeMapData = {context, geometry, votes, provinceRows};
+    renderMap(context, geometry, mapRowsForContext(context, votes, provinceRows, activeMapMetric), activeMapMetric);
+  } catch (error) {
+    console.error(error);
+    $('mapSubtitle').textContent = "Harita verisi yüklenemedi.";
+  }
+}
+function closeMap() {
+  $('mapModal').hidden = true;
+  activeMapData = null;
+}
 function stripePattern(party) {
   const id = `stripe-${party.replace(/[^a-zA-Z0-9_-]/g, "-")}`;
   return {
@@ -1404,6 +1823,7 @@ function draw(rawLinks, baselineLinks = rawLinks, standaloneNodes = []) {
     const bt = g.pos.get(b.target_node_id);
     return (as?.y ?? 0) - (bs?.y ?? 0) || (as?.x ?? 0) - (bs?.x ?? 0) || (at?.x ?? 0) - (bt?.x ?? 0);
   });
+  if (selectedLinkKey && !orderedLinks.some(link => linkKey(link) === selectedLinkKey)) selectedLinkKey = null;
   const selectedKey = selectedNode ? `${selectedNode.stageId}::${selectedNode.party}` : null;
   const sourceGroups = new Map();
   const targetGroups = new Map();
@@ -1466,12 +1886,14 @@ function draw(rawLinks, baselineLinks = rawLinks, standaloneNodes = []) {
       `C ${target.x1} ${midY}, ${source.x1} ${midY}, ${source.x1} ${ay}`,
       "Z",
     ].join(" ");
-    const dim = selectedKey && !connected.linkKeys.has(linkKey(d));
+    const key = linkKey(d);
+    const selected = selectedLinkKey === key;
+    const dim = (selectedKey && !connected.linkKeys.has(key)) || (selectedLinkKey && !selected);
     const gradientId = `flow-gradient-${index}`;
     const sourceMid = (source.x0 + source.x1) / 2;
     const targetMid = (target.x0 + target.x1) / 2;
     gradientDefs.push(`<linearGradient id="${gradientId}" gradientUnits="userSpaceOnUse" x1="${sourceMid}" y1="${ay}" x2="${targetMid}" y2="${by}"><stop offset="0%" stop-color="${colorFor(d.source_party)}"></stop><stop offset="100%" stop-color="${colorFor(d.target_party)}"></stop></linearGradient>`);
-    return `<path class="link ${dim ? 'dim' : ''}" d="${path}" fill="url(#${gradientId})" data-hover="${attr(hover)}"><title>${text(hover)}</title></path>`;
+    return `<path class="link ${selected ? 'selected' : ''} ${dim ? 'dim' : ''}" d="${path}" fill="url(#${gradientId})" focusable="false" tabindex="-1" data-link-index="${index}" data-link-key="${attr(key)}" data-hover="${attr(hover)}"><title>${text(hover)}</title></path>`;
   }).join('');
   const inflatedParties = new Set();
   const nodes = [...g.pos.values()].map(n => {
@@ -1514,9 +1936,26 @@ function draw(rawLinks, baselineLinks = rawLinks, standaloneNodes = []) {
     : '';
   svg.innerHTML = `${defs}${stageLabels}${paths}${nodes}`;
   [...svg.querySelectorAll('[data-hover]')].forEach(item => {
-    item.addEventListener('pointerenter', () => hoverLine(item.dataset.hover));
-    item.addEventListener('pointerdown', () => hoverLine(item.dataset.hover));
-    item.addEventListener('focus', () => hoverLine(item.dataset.hover));
+    const mapContext = () => {
+      if (item.classList.contains('link')) return mapContextForLink(orderedLinks[+item.dataset.linkIndex]);
+      if (item.classList.contains('node')) return mapContextForNode({
+        stageId: item.dataset.stageId,
+        party: item.dataset.party,
+      });
+      return null;
+    };
+    item.addEventListener('pointerenter', () => hoverLine(item.dataset.hover, mapContext()));
+    item.addEventListener('pointerdown', () => hoverLine(item.dataset.hover, mapContext()));
+    item.addEventListener('focus', () => hoverLine(item.dataset.hover, mapContext()));
+  });
+  [...svg.querySelectorAll('.link')].forEach(item => {
+    item.addEventListener('click', event => {
+      event.preventDefault();
+      event.stopPropagation();
+      selectedLinkKey = selectedLinkKey === item.dataset.linkKey ? null : item.dataset.linkKey;
+      selectedNode = null;
+      render();
+    });
   });
   [...svg.querySelectorAll('.split-node-action')].forEach(item => {
     item.addEventListener('pointerdown', event => event.stopPropagation());
@@ -1573,6 +2012,7 @@ function draw(rawLinks, baselineLinks = rawLinks, standaloneNodes = []) {
       if (event.target.closest('.hide-node-action,.split-node-action')) return;
       const current = {stageId: item.dataset.stageId, party: item.dataset.party};
       selectedNode = selectedNode && selectedNode.stageId === current.stageId && selectedNode.party === current.party ? null : current;
+      selectedLinkKey = null;
       selectedStageId = current.stageId;
       render();
     });
