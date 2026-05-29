@@ -79,6 +79,8 @@ const DEFAULT_COLORS = {
   yeniden_refah: "#b1ab06",
   deva_partisi: "#2563eb",
   gelecek_partisi: "#0e7490",
+  evet: "#00c800",
+  hayir: "#a30000",
   diger: "#9e9e9e",
 };
 const PALETTE_ORDER = [
