@@ -53,6 +53,18 @@ function setLoading(loading) {
   if (!svg) return;
   svg.toggleAttribute('aria-busy', loading);
 }
+function setSortWorking(working) {
+  const buttons = [...document.querySelectorAll('#sortMode button[data-sort-mode]')];
+  buttons.forEach(button => {
+    const isFlowButton = button.dataset.sortMode === "flow";
+    button.classList.toggle('working', working && isFlowButton);
+    button.toggleAttribute('aria-busy', working && isFlowButton);
+    button.disabled = working;
+  });
+}
+function nextPaint() {
+  return new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+}
 function dataUnavailable(message) {
   const error = new Error(message);
   error.dataUnavailable = true;
@@ -106,6 +118,8 @@ let selectedStageId = null;
 let selectedNode = null;
 let selectedLinkKey = null;
 const undoStack = [];
+const redoStack = [];
+let pendingHistorySnapshot = null;
 let urlTimer = null;
 let resizeTimer = null;
 const DEFAULT_MIN_BOX = 0;
@@ -295,6 +309,7 @@ function init() {
   renderProvinceOptions();
   setDefaultControls();
   loadSharedView();
+  updateHistoryButtons();
   $('addStage').addEventListener('click', () => {
     pushUndo();
     const last = state.stages[state.stages.length - 1];
@@ -307,24 +322,31 @@ function init() {
     render();
   });
   $('undo').addEventListener('click', undo);
+  $('redo').addEventListener('click', redo);
   $('resetView').addEventListener('click', resetView);
-  $('sortMode').addEventListener('click', () => {
+  $('sortMode').addEventListener('click', event => {
+    const button = event.target.closest('button[data-sort-mode]');
+    if (!button || button.disabled) return;
+    const nextMode = button.dataset.sortMode === "flow" ? "flow" : "vote";
+    if (nextMode === state.sortMode) return;
     pushUndo();
-    state.sortMode = state.sortMode === "flow" ? "vote" : "flow";
+    state.sortMode = nextMode;
     Object.values(state.rows).forEach(row => {
       row.order = [];
     });
+    if (state.sortMode === "flow") setSortWorking(true);
     render();
   });
+  ['minBox', 'minRibbon', 'digerBuckets', 'showBalance', 'showVotes', 'provinceFilter'].forEach(id => trackHistoryEdit($(id)));
   $('minBox').addEventListener('input', () => scheduleRender(120));
-  $('minBox').addEventListener('change', render);
+  $('minBox').addEventListener('change', () => { commitHistoryEdit(); render(); });
   $('minRibbon').addEventListener('input', () => scheduleRender(120));
-  $('minRibbon').addEventListener('change', render);
+  $('minRibbon').addEventListener('change', () => { commitHistoryEdit(); render(); });
   $('digerBuckets').addEventListener('input', () => scheduleRender(120));
-  $('digerBuckets').addEventListener('change', render);
-  $('showBalance').addEventListener('input', render);
-  $('showVotes').addEventListener('input', render);
-  $('provinceFilter').addEventListener('input', render);
+  $('digerBuckets').addEventListener('change', () => { commitHistoryEdit(); render(); });
+  $('showBalance').addEventListener('input', () => { commitHistoryEdit(); render(); });
+  $('showVotes').addEventListener('input', () => { commitHistoryEdit(); render(); });
+  $('provinceFilter').addEventListener('input', () => { commitHistoryEdit(); render(); });
   $('shareView').addEventListener('click', shareView);
   $('hoverInfo').addEventListener('click', event => {
     if (event.target.closest('#openMap')) openMap(activeMapContext);
@@ -413,13 +435,28 @@ function setDefaultControls() {
   $('showVotes').checked = false;
   $('provinceFilter').value = "";
 }
-function pushUndo() {
-  undoStack.push(JSON.stringify({stages: state.stages, rows: state.rows, sortMode: state.sortMode, colors: state.colors, selectedStageId}));
-  if (undoStack.length > 80) undoStack.shift();
+function controlSnapshot() {
+  return {
+    minBox: $('minBox')?.value ?? DEFAULT_MIN_BOX,
+    minRibbon: $('minRibbon')?.value ?? DEFAULT_MIN_RIBBON,
+    digerBuckets: $('digerBuckets')?.value ?? DEFAULT_DIGER_BUCKETS,
+    showBalance: !!$('showBalance')?.checked,
+    showVotes: !!$('showVotes')?.checked,
+    provinceFilter: $('provinceFilter')?.value || "",
+  };
 }
-function undo() {
-  const item = undoStack.pop();
-  if (!item) return;
+function restoreControls(controls = {}) {
+  if ($('minBox')) $('minBox').value = controls.minBox ?? DEFAULT_MIN_BOX;
+  if ($('minRibbon')) $('minRibbon').value = controls.minRibbon ?? DEFAULT_MIN_RIBBON;
+  if ($('digerBuckets')) $('digerBuckets').value = controls.digerBuckets ?? DEFAULT_DIGER_BUCKETS;
+  if ($('showBalance')) $('showBalance').checked = "showBalance" in controls ? !!controls.showBalance : DEFAULT_SHOW_BALANCE;
+  if ($('showVotes')) $('showVotes').checked = !!controls.showVotes;
+  if ($('provinceFilter')) $('provinceFilter').value = controls.provinceFilter || "";
+}
+function historySnapshot() {
+  return JSON.stringify({stages: state.stages, rows: state.rows, sortMode: state.sortMode, colors: state.colors, selectedStageId, controls: controlSnapshot()});
+}
+function restoreHistorySnapshot(item) {
   const old = JSON.parse(item);
   state.stages = old.stages;
   for (const key of Object.keys(state.rows)) delete state.rows[key];
@@ -427,6 +464,52 @@ function undo() {
   state.sortMode = old.sortMode || "vote";
   state.colors = old.colors || {};
   selectedStageId = old.selectedStageId;
+  restoreControls(old.controls);
+}
+function updateHistoryButtons() {
+  const undoButton = $('undo');
+  const redoButton = $('redo');
+  if (undoButton) undoButton.disabled = !undoStack.length;
+  if (redoButton) redoButton.disabled = !redoStack.length;
+}
+function pushUndo() {
+  pushUndoSnapshot(historySnapshot());
+}
+function pushUndoSnapshot(snapshot) {
+  undoStack.push(snapshot);
+  if (undoStack.length > 80) undoStack.shift();
+  redoStack.length = 0;
+  updateHistoryButtons();
+}
+function beginHistoryEdit() {
+  if (!pendingHistorySnapshot) pendingHistorySnapshot = historySnapshot();
+}
+function commitHistoryEdit() {
+  if (pendingHistorySnapshot && pendingHistorySnapshot !== historySnapshot()) {
+    pushUndoSnapshot(pendingHistorySnapshot);
+  }
+  pendingHistorySnapshot = null;
+}
+function trackHistoryEdit(element) {
+  element.addEventListener('focus', beginHistoryEdit);
+  element.addEventListener('pointerdown', beginHistoryEdit);
+}
+function undo() {
+  const item = undoStack.pop();
+  if (!item) return;
+  redoStack.push(historySnapshot());
+  if (redoStack.length > 80) redoStack.shift();
+  restoreHistorySnapshot(item);
+  updateHistoryButtons();
+  render();
+}
+function redo() {
+  const item = redoStack.pop();
+  if (!item) return;
+  undoStack.push(historySnapshot());
+  if (undoStack.length > 80) undoStack.shift();
+  restoreHistorySnapshot(item);
+  updateHistoryButtons();
   render();
 }
 function resetView() {
@@ -651,13 +734,16 @@ function renderColorPalette(nodes = []) {
   const parties = colorPaletteParties(nodes);
   palette.innerHTML = parties.map(party => `<label class="color-item" title="${attr(labelFor(party))}"><input type="color" value="${attr(colorFor(party))}" data-party="${attr(party)}" aria-label="${attr(labelFor(party))} rengi"><span>${text(labelFor(party))}</span></label>`).join("");
   [...palette.querySelectorAll('input[type="color"]')].forEach(input => {
+    trackHistoryEdit(input);
     input.addEventListener('input', () => {
+      beginHistoryEdit();
       state.colors[input.dataset.party] = input.value;
       if (isBalanceParty(input.dataset.party)) state.colors.katilim = input.value;
     });
     input.addEventListener('change', () => {
       state.colors[input.dataset.party] = input.value;
       if (isBalanceParty(input.dataset.party)) state.colors.katilim = input.value;
+      commitHistoryEdit();
       render();
     });
   });
@@ -689,7 +775,10 @@ function showStageDropHint(event) {
   item.classList.add(after ? 'stage-drop-after' : 'stage-drop-before');
 }
 function renderStages() {
-  $('sortMode').textContent = state.sortMode === "flow" ? "Oya göre sırala" : "Akışa göre sırala";
+  [...document.querySelectorAll('#sortMode button[data-sort-mode]')].forEach(button => {
+    button.classList.toggle('active', button.dataset.sortMode === state.sortMode);
+    button.disabled = button.classList.contains('working');
+  });
   $('stageList').innerHTML = state.stages.map((stage, index) => `<div class="stage-item" data-stage-id="${attr(stage.id)}" data-index="${index}"><div class="stage-row ${stage.id === selectedStageId ? 'selected' : ''}" data-stage-id="${attr(stage.id)}" data-index="${index}"><span class="drag-handle">≡</span><select class="stage-select">${nodeOptions(stage.key)}</select><button type="button" class="remove-stage" data-index="${index}" title="Seçimi kaldır">x</button></div>${hiddenChips(stage)}</div>`).join('');
   [...document.querySelectorAll('.stage-row')].forEach(row => {
     row.addEventListener('click', event => {
@@ -1156,6 +1245,9 @@ function stageOrdersCacheKey(nodes, links, stageTotals, usableW) {
     .join("|");
   return [state.sortMode, Math.round(usableW), stageBits, nodeBits, linkBits].join("||");
 }
+function needsFlowOrderCompute(nodes, links, stageTotals, usableW) {
+  return state.sortMode === "flow" && orderCache.key !== stageOrdersCacheKey(nodes, links, stageTotals, usableW);
+}
 function stageOrders(nodes, links, stageTotals, usableW) {
   const nodeById = new Map(nodes.map(node => [node.id, node]));
   const directFlow = new Map();
@@ -1456,26 +1548,25 @@ function layoutNodes(links, baselineLinks = links, standaloneNodes = []) {
     const group = orders.get(stage.id) || [];
     const total = stageTotals.get(stage.id) || group.reduce((a,b)=>a+b.value,0) || 1;
     const gap = 1.5;
-    const scale = (usableW - Math.max(0, group.length - 1) * gap) / total;
-    const minNodeW = mobile
-      ? Math.max(8, Math.min(18, (usableW - Math.max(0, group.length - 1) * gap) / Math.max(group.length, 1)))
-      : 22;
     const availableNodeW = usableW - Math.max(0, group.length - 1) * gap;
-    const rawWidths = group.map(n => Math.max(minNodeW, n.value * scale));
-    const rawTotal = rawWidths.reduce((sum, value) => sum + value, 0) || 1;
-    const fitScale = Math.min(1, availableNodeW / rawTotal);
-    const widths = rawWidths.map(value => value * fitScale);
+    const scale = availableNodeW / total;
+    const minNodeW = mobile
+      ? Math.max(8, Math.min(18, availableNodeW / Math.max(group.length, 1)))
+      : 22;
+    const widths = group.map(n => Math.max(0, n.value * scale));
     const visibleW = widths.reduce((sum, value) => sum + value, 0) + Math.max(0, group.length - 1) * gap;
     let cursor = labelW + Math.max(0, (usableW - visibleW) / 2);
     group.forEach((n, index) => {
       const boxW = widths[index];
-      const flowW = Math.min(boxW, Math.max(0, n.value * scale) * fitScale);
+      const hitW = Math.max(minNodeW, boxW);
       pos.set(n.id, {
         x: cursor,
-        flowX: cursor + (boxW - flowW) / 2,
+        flowX: cursor,
         y: top + si * rowGap - nodeH / 2,
         w: boxW,
-        flowW,
+        flowW: boxW,
+        hitX: cursor + (boxW - hitW) / 2,
+        hitW,
         h: nodeH,
         ...n,
       });
@@ -1483,6 +1574,35 @@ function layoutNodes(links, baselineLinks = links, standaloneNodes = []) {
     });
   });
   return {nodes, links: keptLinks, pos, width, height, stageTotals};
+}
+function layoutSkeleton(links, baselineLinks = links, standaloneNodes = []) {
+  const incoming = new Map();
+  const outgoing = new Map();
+  const sizedBaselineLinks = baselineLinks.filter(isNonDustLink);
+  for (const d of sizedBaselineLinks) {
+    outgoing.set(d.source_node_id, (outgoing.get(d.source_node_id)||0) + d.estimated_flow_votes);
+    incoming.set(d.target_node_id, (incoming.get(d.target_node_id)||0) + d.estimated_flow_votes);
+  }
+  const ids = new Set([...incoming.keys(), ...outgoing.keys()]);
+  const allNodes = [...ids].map(id => {
+    const [stageId, party] = id.split('::');
+    const value = Math.max(incoming.get(id) || 0, outgoing.get(id) || 0);
+    return {id, value, incoming: incoming.get(id) || 0, outgoing: outgoing.get(id) || 0, stageId, party};
+  });
+  standaloneNodes.forEach(node => {
+    if (!ids.has(node.id)) allNodes.push(node);
+  });
+  const stageTotals = new Map();
+  allNodes.forEach(n => stageTotals.set(n.stageId, (stageTotals.get(n.stageId) || 0) + n.value));
+  const nodes = allNodes.filter(n => !tokenHidden(n.stageId, n.party));
+  const nodeSet = new Set(nodes.map(n => n.id));
+  const keptLinks = links.filter(d => isNonDustLink(d) && nodeSet.has(d.source_node_id) && nodeSet.has(d.target_node_id));
+  const mobile = isMobileLayout();
+  const width = mobile ? Math.max($('chart').clientWidth || 360, 320) : Math.max($('chart').clientWidth || 980, 980);
+  const labelW = mobile ? 10 : 42;
+  const rightPad = mobile ? 16 : 44;
+  const usableW = width - labelW - rightPad;
+  return {nodes, links: keptLinks, stageTotals, usableW};
 }
 function groupForToken(row, token) {
   return row.groups.find(group => group.members.includes(token) || groupName(group) === token);
@@ -2172,7 +2292,6 @@ function draw(rawLinks, baselineLinks = rawLinks, standaloneNodes = []) {
     gradientDefs.push(`<linearGradient id="${gradientId}" gradientUnits="userSpaceOnUse" x1="${sourceMid}" y1="${ay}" x2="${targetMid}" y2="${by}"><stop offset="0%" stop-color="${colorFor(d.source_party)}"></stop><stop offset="100%" stop-color="${colorFor(d.target_party)}"></stop></linearGradient>`);
     return `<path class="link ${selected ? 'selected' : ''} ${dim ? 'dim' : ''}" d="${path}" fill="url(#${gradientId})" focusable="false" tabindex="-1" data-link-index="${index}" data-link-key="${attr(key)}" data-hover="${attr(hover)}"><title>${text(hover)}</title></path>`;
   }).join('');
-  const inflatedParties = new Set();
   const nodes = [...g.pos.values()].map(n => {
     const mobile = isMobileLayout();
     const displayValue = nodeDisplayValues.get(n.id) || n.value;
@@ -2184,20 +2303,21 @@ function draw(rawLinks, baselineLinks = rawLinks, standaloneNodes = []) {
     const rotated = n.w < 52;
     const compact = n.w < (mobile ? 44 : 64);
     const showPct = val && !compact && !rotated;
-    const labelText = rotated
+    const showLabel = n.w >= (mobile ? 8 : 14);
+    const labelText = !showLabel
+      ? `<text class="node-label node-label-hidden" x="${n.x + n.w/2}" y="${n.y + n.h/2}" text-anchor="middle">${text(label)}</text>`
+      : (rotated
       ? `<text class="node-label rotated" transform="translate(${n.x + n.w/2} ${n.y + n.h/2}) rotate(-90)" text-anchor="middle">${text(label)}</text>`
-      : `<text class="node-label" x="${n.x + n.w/2}" y="${n.y + (showPct ? n.h/2 - 8 : n.h/2 + 6)}" text-anchor="middle">${text(label)}</text>`;
+      : `<text class="node-label" x="${n.x + n.w/2}" y="${n.y + (showPct ? n.h/2 - 8 : n.h/2 + 6)}" text-anchor="middle">${text(label)}</text>`);
     const pctText = showPct ? `<text class="node-pct" x="${n.x + n.w/2}" y="${n.y + n.h/2 + 17}" text-anchor="middle">${text(val)}</text>` : '';
     const selected = selectedNode && selectedNode.stageId === n.stageId && selectedNode.party === n.party;
     const dim = selectedKey && !connected.nodes.has(n.id);
     const row = rowState(n.stageId);
     const group = groupForToken(row, n.party);
-    const inflated = (n.flowW ?? n.w) + 0.5 < n.w;
-    if (inflated) inflatedParties.add(n.party);
-    const shellFill = inflated ? `url(#${stripePattern(n.party).id})` : colorFor(n.party);
-    const fillRect = inflated
-      ? `<rect class="node-fill" x="${n.flowX}" y="${n.y}" width="${n.flowW}" height="${n.h}" fill="${colorFor(n.party)}"></rect>`
-      : `<rect class="node-fill" x="${n.x}" y="${n.y}" width="${n.w}" height="${n.h}" fill="${colorFor(n.party)}"></rect>`;
+    const hitRect = !mobile && (n.hitW || n.w) > n.w + 0.5
+      ? `<rect class="node-hit" x="${n.hitX}" y="${n.y}" width="${n.hitW}" height="${n.h}" fill="transparent" style="stroke:none;pointer-events:all"></rect>`
+      : '';
+    const fillRect = `<rect class="node-fill" x="${n.x}" y="${n.y}" width="${n.w}" height="${n.h}" fill="${colorFor(n.party)}"></rect>`;
     const showNodeActions = !isMobileLayout() || n.w >= 34;
     const splitButton = showNodeActions && group && group.members.length > 1
       ? `<g class="split-node-action" data-stage-id="${attr(n.stageId)}" data-party="${attr(n.party)}"><rect class="split-hit" x="${n.x + 4}" y="${n.y + 6}" width="20" height="20" rx="3"></rect><text class="split-node" x="${n.x + 14}" y="${n.y + 17}" text-anchor="middle">/</text></g>`
@@ -2206,9 +2326,9 @@ function draw(rawLinks, baselineLinks = rawLinks, standaloneNodes = []) {
     const hideButton = showNodeActions
       ? `<g class="hide-node-action" data-stage-id="${attr(n.stageId)}" data-party="${attr(n.party)}"><rect class="hide-hit" x="${hideX}" y="${n.y + 6}" width="20" height="20" rx="3"></rect><text class="hide-node" x="${hideX + 10}" y="${n.y + 17}" text-anchor="middle">x</text></g>`
       : '';
-    return `<g class="node ${inflated ? 'inflated' : ''} ${selected ? 'selected' : ''} ${dim ? 'dim' : ''}" data-stage-id="${attr(n.stageId)}" data-party="${attr(n.party)}" data-hover="${attr(hover)}"><title>${text(hover)}${inflated ? "\nTıklama için genişletildi" : ""}</title><rect class="node-shell" x="${n.x}" y="${n.y}" width="${n.w}" height="${n.h}" style="fill:${shellFill}"></rect>${fillRect}${labelText}${pctText}${splitButton}${hideButton}</g>`;
+    return `<g class="node ${selected ? 'selected' : ''} ${dim ? 'dim' : ''}" data-stage-id="${attr(n.stageId)}" data-party="${attr(n.party)}" data-hover="${attr(hover)}"><title>${text(hover)}</title><rect class="node-shell" x="${n.x}" y="${n.y}" width="${n.w}" height="${n.h}" fill="${colorFor(n.party)}"></rect>${fillRect}${hitRect}${labelText}${pctText}${splitButton}${hideButton}</g>`;
   }).join('');
-  const defsContent = `${gradientDefs.join("")}${[...inflatedParties].map(party => stripePattern(party).markup).join("")}`;
+  const defsContent = gradientDefs.join("");
   const defs = defsContent
     ? `<defs>${defsContent}</defs>`
     : '';
@@ -2318,7 +2438,6 @@ async function render() {
   const seq = ++renderSeq;
   updateUrlState();
   setLoading(true);
-  svgMessage("Yükleniyor...");
   try {
     const baseLinks = await chainLinks();
     const standaloneNodes = await singleStageNodes();
@@ -2326,7 +2445,12 @@ async function render() {
     const baselineLinks = state.stages.length === 1 ? [] : aggregatedLinks(baseLinks, true);
     const groupedLinks = state.stages.length === 1 ? [] : aggregatedLinks(baseLinks);
     const links = visibleRibbons(groupedLinks);
+    const skeleton = layoutSkeleton(links, baselineLinks, standaloneNodes);
+    const showSortWorking = needsFlowOrderCompute(skeleton.nodes, skeleton.links, skeleton.stageTotals, skeleton.usableW);
+    setSortWorking(showSortWorking);
     renderStages();
+    if (showSortWorking) await nextPaint();
+    if (seq !== renderSeq) return;
     draw(links, baselineLinks, standaloneNodes);
     restoreSharedMapIfNeeded();
   } catch (error) {
@@ -2341,7 +2465,10 @@ async function render() {
       hoverLine("Veri yüklenemedi.");
     }
   } finally {
-    if (seq === renderSeq) setLoading(false);
+    if (seq === renderSeq) {
+      setLoading(false);
+      setSortWorking(false);
+    }
   }
 }
 init();

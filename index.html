@@ -14,9 +14,18 @@
   <button id="collapseSidebar" type="button" class="ghost-button collapse-sidebar" title="Menüyü daralt" aria-label="Menüyü daralt">☰</button>
   <div class="sidebar-content">
   <button id="resetView" type="button" class="danger-button">Sıfırla</button>
+  <div class="history-actions" aria-label="Geçmiş">
+    <button id="undo" type="button" class="ghost-button icon-button" title="Geri al" aria-label="Geri al">↶</button>
+    <button id="redo" type="button" class="ghost-button icon-button" title="Yinele" aria-label="Yinele">↷</button>
+  </div>
   <button id="shareView" type="button" class="ghost-button">Paylaş</button>
-  <button id="sortMode" type="button" class="ghost-button">Akışa göre sırala</button>
-  <button id="undo" type="button" class="ghost-button">Geri al</button>
+  <div class="sort-control">
+    <span>Sıralama</span>
+    <div id="sortMode" class="sort-toggle" role="group" aria-label="Sıralama">
+      <button type="button" data-sort-mode="vote">Oy</button>
+      <button type="button" data-sort-mode="flow">Akış</button>
+    </div>
+  </div>
   <label>Minimum oy</label>
   <div class="row">
     <div>
