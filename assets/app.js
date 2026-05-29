@@ -6,6 +6,7 @@ const flowPromises = {};
 const provinceFlowPromises = {};
 const ilceVotePromises = {};
 let ilceGeometryPromise = null;
+let ilGeometryPromise = null;
 const DEFAULT_MODEL_PRIORITY = [
   "balanced_forward_bayes",
   "balanced_forward_bayes_2023_mv_cb",
@@ -19,12 +20,14 @@ let lastDragEndedAt = 0;
 let activeMapContext = null;
 let activeMapData = null;
 let activeMapMetric = "count";
+let pendingShareMapState = null;
 const $ = id => document.getElementById(id);
 const fmt = new Intl.NumberFormat('en-US', {maximumFractionDigits: 0});
 const pct = x => "%" + (100*x).toFixed(1);
 const million = x => (x / 1000000).toFixed(1) + "M";
 const text = value => String(value).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
 const attr = value => text(value).replaceAll('"', "&quot;");
+const desktopHoverMedia = window.matchMedia("(hover: hover) and (pointer: fine)");
 const hoverLine = (message, mapContext = null) => {
   const el = $('hoverInfo');
   activeMapContext = mapContext;
@@ -323,9 +326,11 @@ function init() {
     renderMap(
       activeMapData.context,
       activeMapData.geometry,
+      activeMapData.provinceGeometry,
       mapRowsForContext(activeMapData.context, activeMapData.votes, activeMapData.provinceRows, activeMapMetric),
       activeMapMetric,
     );
+    updateUrlState();
   });
   $('mapModal').addEventListener('click', event => {
     if (event.target === $('mapModal')) closeMap();
@@ -343,6 +348,7 @@ function init() {
         renderMap(
           activeMapData.context,
           activeMapData.geometry,
+          activeMapData.provinceGeometry,
           mapRowsForContext(activeMapData.context, activeMapData.votes, activeMapData.provinceRows, activeMapMetric),
           activeMapMetric,
         );
@@ -449,8 +455,39 @@ function encodeShareState() {
     votes: $('showVotes').checked,
     il: $('provinceFilter').value || "",
     c: state.colors,
+    map: encodeMapShareState(),
   };
   return encodeSharePayload(payload);
+}
+function stageIndexForId(stageId) {
+  return state.stages.findIndex(stage => stage.id === stageId);
+}
+function encodeMapShareState() {
+  const context = activeMapData?.context || activeMapContext;
+  const map = {
+    o: !$('mapModal')?.hidden,
+    metric: activeMapMetric,
+  };
+  if (!context) return map;
+  if (context.kind === "flow") {
+    map.ctx = {
+      k: "flow",
+      si: stageIndexForId(context.sourceStageId),
+      ti: stageIndexForId(context.targetStageId),
+      sp: context.sourceToken,
+      tp: context.targetToken,
+    };
+  } else if (context.kind === "party") {
+    map.ctx = {
+      k: "party",
+      si: stageIndexForId(context.stageId),
+      p: context.partyToken,
+    };
+  }
+  if (map.ctx && Object.values(map.ctx).some(value => value === undefined || value === null || value === -1)) {
+    delete map.ctx;
+  }
+  return map;
 }
 function currentShareUrl() {
   const url = new URL(window.location.href);
@@ -506,6 +543,7 @@ function loadSharedView() {
     $('showVotes').checked = !!payload.votes;
     state.colors = payload.c && typeof payload.c === "object" ? payload.c : {};
     if (payload.il && (DATA.provinces || []).includes(payload.il)) $('provinceFilter').value = payload.il;
+    pendingShareMapState = payload.map && typeof payload.map === "object" ? payload.map : null;
     return true;
   } catch (error) {
     console.warn(error);
@@ -783,6 +821,16 @@ async function loadIlceGeometry() {
     });
   }
   return ilceGeometryPromise;
+}
+async function loadIlGeometry() {
+  if (!DATA.maps?.il) return null;
+  if (!ilGeometryPromise) {
+    ilGeometryPromise = fetch(DATA.maps.il).then(async response => {
+      if (!response.ok) throw new Error(`failed to load ${DATA.maps.il}`);
+      return response.json();
+    });
+  }
+  return ilGeometryPromise;
 }
 function bestModelForPair(pairKey) {
   const summary = DATA.cv_summaries[pairKey] || [];
@@ -1479,6 +1527,8 @@ function mapContextForLink(link) {
     model,
     sourceStageId: link.source_stage_id,
     targetStageId: link.target_stage_id,
+    sourceToken: link.source_party,
+    targetToken: link.target_party,
     sourceParties: tokenMemberParties(link.source_stage_id, link.source_party, rows),
     targetParties: tokenMemberParties(link.target_stage_id, link.target_party, rows),
     title: `${labelFor(link.source_party)} -> ${labelFor(link.target_party)}`,
@@ -1506,13 +1556,46 @@ function mapContextForNode(node) {
     model,
     side,
     stageId: node.stageId,
+    partyToken: node.party,
     parties: tokenMemberParties(node.stageId, node.party, rows),
     title: labelFor(node.party),
     subtitle: stageLabel(stage.key),
   };
 }
+function mapContextFromShareState(mapState) {
+  const ctx = mapState?.ctx;
+  if (!ctx || typeof ctx !== "object") return null;
+  if (ctx.k === "flow") {
+    const sourceStage = state.stages[+ctx.si];
+    const targetStage = state.stages[+ctx.ti];
+    if (!sourceStage || !targetStage || typeof ctx.sp !== "string" || typeof ctx.tp !== "string") return null;
+    return mapContextForLink({
+      source_stage_id: sourceStage.id,
+      target_stage_id: targetStage.id,
+      source_party: ctx.sp,
+      target_party: ctx.tp,
+    });
+  }
+  if (ctx.k === "party") {
+    const stage = state.stages[+ctx.si];
+    if (!stage || typeof ctx.p !== "string") return null;
+    return mapContextForNode({stageId: stage.id, party: ctx.p});
+  }
+  return null;
+}
+function restoreSharedMapIfNeeded() {
+  if (!pendingShareMapState) return;
+  const mapState = pendingShareMapState;
+  pendingShareMapState = null;
+  const context = mapContextFromShareState(mapState);
+  if (!context) return;
+  activeMapContext = context;
+  if (mapState.o) openMap(context, typeof mapState.metric === "string" ? mapState.metric : null);
+}
 function districtKey(il, ilce) {
-  return `${locationKey(il)}::${locationKey(ilce)}`;
+  const ilKey = locationKey(il);
+  const ilceKey = locationKey(ilce);
+  return `${ilKey}::${ilceKey === ilKey ? "MERKEZ" : ilceKey}`;
 }
 function locationKey(value) {
   return String(value || "")
@@ -1523,6 +1606,9 @@ function locationKey(value) {
     .toUpperCase()
     .replace(/\s+/g, " ")
     .trim();
+}
+function districtDisplayName(il, ilce) {
+  return locationKey(ilce) === locationKey(il) ? "MERKEZ" : ilce;
 }
 function transitionAt(provinceRows, province, sourceParty, targetParty) {
   const row = provinceRows.find(item =>
@@ -1668,6 +1754,25 @@ function focusMapRow(key) {
   row.classList.add('selected');
   row.scrollIntoView({block: "center", behavior: "smooth"});
 }
+function showMapTooltip(message, event) {
+  if (!desktopHoverMedia.matches || !message) return;
+  const tip = $('mapTooltip');
+  if (!tip) return;
+  tip.textContent = message;
+  tip.hidden = false;
+  const margin = 12;
+  const box = tip.getBoundingClientRect();
+  let x = event.clientX + 14;
+  let y = event.clientY + 14;
+  if (x + box.width + margin > window.innerWidth) x = event.clientX - box.width - 14;
+  if (y + box.height + margin > window.innerHeight) y = event.clientY - box.height - 14;
+  tip.style.left = `${Math.max(margin, x)}px`;
+  tip.style.top = `${Math.max(margin, y)}px`;
+}
+function hideMapTooltip() {
+  const tip = $('mapTooltip');
+  if (tip) tip.hidden = true;
+}
 function updateMapMetricControls(context) {
   const options = context.kind === "flow"
     ? [["count", "#"], ["transition", "%"]]
@@ -1677,7 +1782,7 @@ function updateMapMetricControls(context) {
     `<button type="button" class="${metric === activeMapMetric ? 'active' : ''}" data-metric="${attr(metric)}">${text(label)}</button>`
   )).join("");
 }
-function renderMap(context, geometry, rows, metric = "count") {
+function renderMap(context, geometry, provinceGeometry, rows, metric = "count") {
   const svg = $('mapChart');
   const allPoints = geometry.features.flatMap(feature => featureCoordinates(feature.geometry));
   const xs = allPoints.map(point => point[0]);
@@ -1701,7 +1806,7 @@ function renderMap(context, geometry, rows, metric = "count") {
   const contrast = metric === "share" || metric === "transition";
   const provinceOnly = context.kind === "flow" && metric === "transition";
   const maxAbs = Math.max(...rows.map(row => Math.abs(row.colorValue || 0)), 0);
-  svg.innerHTML = geometry.features.map(feature => {
+  const districtPaths = geometry.features.map(feature => {
     const props = feature.properties || {};
     const key = districtKey(props.il, props.ilce);
     const rowKey = provinceOnly ? locationKey(props.il) : key;
@@ -1709,13 +1814,21 @@ function renderMap(context, geometry, rows, metric = "count") {
     const colorValue = colorValues.get(key) || 0;
     const klass = value ? "map-district" : "map-district empty";
     const fill = contrast ? mapDivergingColor(colorValue, maxAbs) : mapColor(value, maxValue);
+    const ilceLabel = districtDisplayName(props.il, props.ilce);
     const title = contrast
-      ? `${props.il} / ${props.ilce}: ${formatMapValue(context, metric, value)} (${formatSignedPp(colorValue)})`
-      : `${props.il} / ${props.ilce}: ${formatMapValue(context, metric, value)}`;
-    return `<path class="${klass}" d="${geoPath(feature.geometry, project)}" fill="${fill}" data-map-row-key="${attr(rowKey)}"><title>${text(title)}</title></path>`;
+      ? `${props.il} / ${ilceLabel}: ${formatMapValue(context, metric, value)} (${formatSignedPp(colorValue)})`
+      : `${props.il} / ${ilceLabel}: ${formatMapValue(context, metric, value)}`;
+    return `<path class="${klass}" d="${geoPath(feature.geometry, project)}" fill="${fill}" data-map-row-key="${attr(rowKey)}" data-map-tip="${attr(title)}"></path>`;
   }).join("");
+  const provincePaths = (provinceGeometry?.features || []).map(feature => (
+    `<path class="map-province-border" d="${geoPath(feature.geometry, project)}"></path>`
+  )).join("");
+  svg.innerHTML = `${districtPaths}${provincePaths}`;
   svg.querySelectorAll('.map-district:not(.empty)').forEach(path => {
     path.addEventListener('click', () => focusMapRow(path.dataset.mapRowKey));
+    path.addEventListener('pointerenter', event => showMapTooltip(path.dataset.mapTip, event));
+    path.addEventListener('pointermove', event => showMapTooltip(path.dataset.mapTip, event));
+    path.addEventListener('pointerleave', hideMapTooltip);
   });
   $('mapTitle').textContent = context.title;
   $('mapSubtitle').textContent = context.subtitle;
@@ -1729,7 +1842,7 @@ function renderMap(context, geometry, rows, metric = "count") {
     `<div class="map-row" data-map-row-key="${attr(mapListKey(row, provinceOnly))}"><span>${text(mapRowLabel(row, provinceOnly))}</span><strong>${formatMapValue(context, metric, row.value)}${contrast ? ` (${formatSignedPp(row.colorValue)})` : ""}</strong></div>`
   )).join("");
 }
-async function openMap(context) {
+async function openMap(context, metric = null) {
   if (!context) return;
   $('mapModal').hidden = false;
   $('mapTitle').textContent = context.title;
@@ -1737,23 +1850,25 @@ async function openMap(context) {
   $('mapChart').innerHTML = "";
   $('mapLegend').textContent = "";
   $('mapRows').textContent = "";
-  activeMapMetric = context.kind === "flow" ? "transition" : "share";
+  activeMapMetric = metric || (context.kind === "flow" ? "transition" : "share");
   updateMapMetricControls(context);
   try {
     const loaders = [
       loadIlceVotes(context.pairKey, context.model),
       loadIlceGeometry(),
+      loadIlGeometry(),
     ];
     if (context.kind === "flow") {
       loaders.push(ensureProvincePairModel(context.pairKey, context.model));
       loaders.push(ensurePairModel(context.pairKey, context.model));
     }
-    const [votes, geometry] = await Promise.all(loaders);
+    const [votes, geometry, provinceGeometry] = await Promise.all(loaders);
     const provinceRows = context.kind === "flow"
       ? provincePairLinks(context.pairKey, context.model, "")
       : [];
-    activeMapData = {context, geometry, votes, provinceRows};
-    renderMap(context, geometry, mapRowsForContext(context, votes, provinceRows, activeMapMetric), activeMapMetric);
+    activeMapData = {context, geometry, provinceGeometry, votes, provinceRows};
+    renderMap(context, geometry, provinceGeometry, mapRowsForContext(context, votes, provinceRows, activeMapMetric), activeMapMetric);
+    updateUrlState();
   } catch (error) {
     console.error(error);
     $('mapSubtitle').textContent = "Harita verisi yüklenemedi.";
@@ -1762,6 +1877,8 @@ async function openMap(context) {
 function closeMap() {
   $('mapModal').hidden = true;
   activeMapData = null;
+  hideMapTooltip();
+  updateUrlState();
 }
 function stripePattern(party) {
   const id = `stripe-${party.replace(/[^a-zA-Z0-9_-]/g, "-")}`;
@@ -1975,7 +2092,9 @@ function draw(rawLinks, baselineLinks = rawLinks, standaloneNodes = []) {
       });
       return null;
     };
-    item.addEventListener('pointerenter', () => hoverLine(item.dataset.hover, mapContext()));
+    item.addEventListener('pointerenter', () => {
+      if (!desktopHoverMedia.matches) hoverLine(item.dataset.hover, mapContext());
+    });
     item.addEventListener('pointerdown', () => hoverLine(item.dataset.hover, mapContext()));
     item.addEventListener('focus', () => hoverLine(item.dataset.hover, mapContext()));
   });
@@ -2075,6 +2194,7 @@ async function render() {
     const links = visibleRibbons(groupedLinks);
     renderStages();
     draw(links, baselineLinks, standaloneNodes);
+    restoreSharedMapIfNeeded();
   } catch (error) {
     if (seq !== renderSeq) return;
     console.error(error);
