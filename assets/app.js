@@ -105,6 +105,7 @@ let resizeTimer = null;
 const DEFAULT_MIN_BOX = 0;
 const DEFAULT_MIN_RIBBON = 0;
 const DEFAULT_DIGER_BUCKETS = 1;
+const DEFAULT_SHOW_BALANCE = false;
 const state = {
   stages: [],
   rows: {},
@@ -199,8 +200,8 @@ function labelFor(party) {
     recep_tayyip_erdogan: "RTE",
     muharrem_ince: "İnce",
     diger: "Diğer",
-    dengeleme_kaynak: "Dengeleme",
-    dengeleme_hedef: "Dengeleme",
+    dengeleme_kaynak: "Katılım",
+    dengeleme_hedef: "Katılım",
   };
   return labels[party] || party.replaceAll("_", " ");
 }
@@ -280,6 +281,7 @@ function init() {
   state.stages = defaults.map(key => newStage(key));
   selectedStageId = state.stages[0]?.id || null;
   renderProvinceOptions();
+  setDefaultControls();
   loadSharedView();
   $('addStage').addEventListener('click', () => {
     pushUndo();
@@ -389,7 +391,7 @@ function setDefaultControls() {
   $('minBox').value = DEFAULT_MIN_BOX;
   $('minRibbon').value = DEFAULT_MIN_RIBBON;
   $('digerBuckets').value = DEFAULT_DIGER_BUCKETS;
-  $('showBalance').checked = false;
+  $('showBalance').checked = DEFAULT_SHOW_BALANCE;
   $('showVotes').checked = false;
   $('provinceFilter').value = "";
 }
@@ -500,7 +502,7 @@ function loadSharedView() {
     if (Number.isFinite(+payload.b)) $('minBox').value = +payload.b;
     if (Number.isFinite(+payload.a)) $('minRibbon').value = +payload.a;
     if (Number.isFinite(+payload.d)) $('digerBuckets').value = Math.max(1, Math.min(6, +payload.d));
-    $('showBalance').checked = !!payload.bal;
+    $('showBalance').checked = "bal" in payload ? !!payload.bal : DEFAULT_SHOW_BALANCE;
     $('showVotes').checked = !!payload.votes;
     state.colors = payload.c && typeof payload.c === "object" ? payload.c : {};
     if (payload.il && (DATA.provinces || []).includes(payload.il)) $('provinceFilter').value = payload.il;
@@ -528,9 +530,14 @@ function availableSources(target) {
   return DATA.manifest.pairs.filter(pair => pair.target.key === target).map(pair => pair.source.key);
 }
 function adjacentPairForStage(stageKey) {
-  return DATA.manifest.pairs.find(pair => pair.source.key === stageKey && bestModelForPair(pair.pair_key))
-    || DATA.manifest.pairs.find(pair => pair.target.key === stageKey && bestModelForPair(pair.pair_key))
-    || null;
+  return DATA.manifest.pairs
+    .filter(pair => bestModelForPair(pair.pair_key) && (pair.source.key === stageKey || pair.target.key === stageKey))
+    .sort((a, b) => pairStageValidVotes(b, stageKey) - pairStageValidVotes(a, stageKey))[0] || null;
+}
+function pairStageValidVotes(pair, stageKey) {
+  if (pair.source.key === stageKey) return +pair.source_valid_votes || 0;
+  if (pair.target.key === stageKey) return +pair.target_valid_votes || 0;
+  return 0;
 }
 function repairChainAround(index) {
   for (let i = index; i < state.stages.length - 1; i++) {
@@ -1795,12 +1802,35 @@ function connectedSelection(links, selectedKey) {
   walk(selectedKey, outgoing, link => link.target_node_id);
   return {nodes, linkKeys};
 }
+function observedNodeValue(node, links) {
+  if (isBalanceParty(node.party)) return node.value;
+  const row = rowState(node.stageId);
+  if (groupForToken(row, node.party)) return node.value;
+  let value = 0;
+  links.forEach(link => {
+    if (link.source_node_id === node.id || (link.source_stage_id === node.stageId && link.source_party === node.party)) {
+      value = Math.max(value, +link.source_observed_votes || +link.source_votes || 0);
+    }
+    if (link.target_node_id === node.id || (link.target_stage_id === node.stageId && link.target_party === node.party)) {
+      value = Math.max(value, +link.target_votes || 0);
+    }
+  });
+  return value || node.value;
+}
 function draw(rawLinks, baselineLinks = rawLinks, standaloneNodes = []) {
   const g = layoutNodes(rawLinks, baselineLinks, standaloneNodes);
   renderColorPalette(g.nodes);
   const showVotes = $('showVotes').checked;
   const svg = $('chart');
   svg.setAttribute('viewBox', `0 0 ${g.width} ${g.height}`);
+  const nodeDisplayValues = new Map();
+  const displayStageTotals = new Map();
+  [...g.pos.values()].forEach(node => {
+    const value = observedNodeValue(node, baselineLinks);
+    nodeDisplayValues.set(node.id, value);
+    if (isBalanceParty(node.party)) return;
+    displayStageTotals.set(node.stageId, (displayStageTotals.get(node.stageId) || 0) + value);
+  });
   const stageLabels = state.stages.map(stage => {
     const stageNodes = [...g.pos.values()].filter(n => n.stageId === stage.id);
     if (!stageNodes.length) return "";
@@ -1898,11 +1928,12 @@ function draw(rawLinks, baselineLinks = rawLinks, standaloneNodes = []) {
   const inflatedParties = new Set();
   const nodes = [...g.pos.values()].map(n => {
     const mobile = isMobileLayout();
-    const share = n.value / Math.max(g.stageTotals.get(n.stageId) || 0, 1);
+    const displayValue = nodeDisplayValues.get(n.id) || n.value;
+    const share = displayValue / Math.max(displayStageTotals.get(n.stageId) || g.stageTotals.get(n.stageId) || 0, 1);
     const showValue = share >= (mobile ? 0.012 : 0.018) || n.w >= (mobile ? 30 : 48);
-    const val = showValue ? (showVotes ? million(n.value) : pct(share)) : '';
+    const val = showValue ? (showVotes ? million(displayValue) : pct(share)) : '';
     const label = labelFor(n.party);
-    const hover = describeNode(label, n.value, share);
+    const hover = describeNode(label, displayValue, share);
     const rotated = n.w < 52;
     const compact = n.w < (mobile ? 44 : 64);
     const showPct = val && !compact && !rotated;
