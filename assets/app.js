@@ -2049,7 +2049,11 @@ function updateMapMetricControls(context) {
 function renderMap(context, geometry, provinceGeometry, rows, metric = "count") {
   const svg = $('mapChart');
   const allPoints = geometry.features.flatMap(feature => featureCoordinates(feature.geometry));
-  const xs = allPoints.map(point => point[0]);
+  const latitudes = allPoints.map(point => point[1]);
+  const midLatitude = (Math.min(...latitudes) + Math.max(...latitudes)) / 2;
+  const longitudeScale = Math.cos(midLatitude * Math.PI / 180);
+  const projectedX = point => point[0] * longitudeScale;
+  const xs = allPoints.map(projectedX);
   const ys = allPoints.map(point => point[1]);
   const minX = Math.min(...xs), maxX = Math.max(...xs);
   const minY = Math.min(...ys), maxY = Math.max(...ys);
@@ -2057,11 +2061,12 @@ function renderMap(context, geometry, provinceGeometry, rows, metric = "count") 
   const box = svg.getBoundingClientRect();
   const width = Math.max(box.width || svg.clientWidth || 760, 320);
   const height = Math.max(box.height || svg.clientHeight || 520, 80);
+  svg.setAttribute("preserveAspectRatio", "xMidYMid meet");
   svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
   const pad = 14;
   const scale = Math.min((width - pad * 2) / (maxX - minX), (height - pad * 2) / (maxY - minY));
   const project = point => [
-    pad + (point[0] - minX) * scale,
+    pad + (projectedX(point) - minX) * scale,
     height - pad - (point[1] - minY) * scale,
   ];
   const values = new Map(rows.map(row => [districtKey(row.il, row.ilce), row.value]));
