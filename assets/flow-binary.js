@@ -88,3 +88,33 @@ export function decodeIlceVoteBinary(buffer) {
     rows,
   };
 }
+
+export function decodePairErrorsBinary(buffer) {
+  const view = new DataView(buffer);
+  const magic = String.fromCharCode(...new Uint8Array(buffer, 0, 4));
+  if (magic !== "EIE1") throw new Error("bad pair error binary magic");
+  const headerLength = view.getUint32(4, true);
+  const headerBytes = new Uint8Array(buffer, 8, headerLength);
+  const header = JSON.parse(new TextDecoder().decode(headerBytes));
+  let offset = 8 + headerLength;
+  const out = {};
+  for (let i = 0; i < header.row_count; i++) {
+    const pairKey = header.pairs[view.getUint16(offset, true)];
+    offset += 2;
+    out[pairKey] = {};
+    for (const model of header.models) {
+      const l1 = view.getFloat64(offset, true); offset += 8;
+      const halfL1 = view.getFloat64(offset, true); offset += 8;
+      const absError = view.getFloat64(offset, true); offset += 8;
+      const votes = view.getFloat64(offset, true); offset += 8;
+      out[pairKey][model] = {
+        l1_per_1000: l1,
+        half_l1_per_1000: halfL1,
+        mae_per_1000: l1,
+        abs_error: absError,
+        votes,
+      };
+    }
+  }
+  return out;
+}

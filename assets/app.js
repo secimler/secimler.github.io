@@ -1,13 +1,16 @@
-import {decodeFlowBinary, decodeIlceVoteBinary} from "./flow-binary.js";
+import {decodeFlowBinary, decodeIlceVoteBinary, decodePairErrorsBinary} from "./flow-binary.js";
 import {decodeSharePayload, encodeSharePayload} from "./share-state.js";
 
 const DATA = JSON.parse(document.getElementById('ei-data').textContent);
+const DEBUG = new URLSearchParams(window.location.search).has("dbg");
 const flowPromises = {};
 const provinceFlowPromises = {};
 const ilceVotePromises = {};
+let pairErrorsPromise = null;
 let ilceGeometryPromise = null;
 let ilGeometryPromise = null;
 const DEFAULT_MODEL_PRIORITY = [
+  "balanced_forward_bayes_ilce_full_l100",
   "balanced_forward_bayes",
   "balanced_forward_bayes_2023_mv_cb",
   "joint_margin_balanced",
@@ -15,6 +18,10 @@ const DEFAULT_MODEL_PRIORITY = [
   "province_penalty",
   "joint_bidirectional",
 ];
+const MODEL_LABELS = {
+  balanced_forward_bayes: "balanced_forward_bayes",
+  balanced_forward_bayes_ilce_full_l100: "ilce_full_l100",
+};
 let renderSeq = 0;
 let lastDragEndedAt = 0;
 let activeMapContext = null;
@@ -131,6 +138,7 @@ const state = {
   rows: {},
   sortMode: "vote",
   colors: {},
+  model: "",
 };
 function generatedColor(s) {
   let h = 0;
@@ -284,9 +292,16 @@ function shortStageCode(key) {
   };
   return labels[key] || stageLabel(key).replace(/^20/, "").replace(/^19/, "").replace("Bld. Meclisi", "BM").replace("Ref.", "Rf");
 }
-function stageLabelSvg(key, x, y, h) {
-  const label = shortStageCode(key);
+function stageLabelSvg(label, x, y, h) {
   return `<g><rect class="stage-label-box" x="${x}" y="${y}" width="30" height="${h}" rx="5"></rect><text class="stage-label" transform="translate(${x + 15} ${y + h / 2}) rotate(-90)" x="0" y="0">${text(label)}</text></g>`;
+}
+function stageErrorSvg(label, x, y, h) {
+  return `<g><rect class="stage-error-box" x="${x}" y="${y}" width="30" height="${h}" rx="5"></rect><text class="stage-error-label" transform="translate(${x + 15} ${y + h / 2}) rotate(-90)" x="0" y="0">${text(label)}</text></g>`;
+}
+function pairErrorLabel(pairKey, model) {
+  const value = DATA.pair_errors?.[pairKey]?.[model]?.half_l1_per_1000;
+  if (!Number.isFinite(+value)) return "";
+  return `${Math.round(+value)}‰`;
 }
 function isNonDustLink(link) {
   return (+link.estimated_flow_votes || 0) >= 1;
@@ -300,6 +315,7 @@ function defaultStageKeys() {
   return defaults.slice(0, 1);
 }
 function init() {
+  document.body.classList.toggle("debug", DEBUG);
   if (isMobileLayout()) {
     document.body.classList.add('sidebar-collapsed');
   }
@@ -307,6 +323,7 @@ function init() {
   state.stages = defaults.map(key => newStage(key));
   selectedStageId = state.stages[0]?.id || null;
   renderProvinceOptions();
+  renderModelOptions();
   setDefaultControls();
   loadSharedView();
   updateHistoryButtons();
@@ -337,7 +354,7 @@ function init() {
     if (state.sortMode === "flow") setSortWorking(true);
     render();
   });
-  ['minBox', 'minRibbon', 'digerBuckets', 'showBalance', 'showVotes', 'provinceFilter'].forEach(id => trackHistoryEdit($(id)));
+  ['minBox', 'minRibbon', 'digerBuckets', 'showBalance', 'showVotes', 'provinceFilter', 'modelSwitch'].forEach(id => trackHistoryEdit($(id)));
   $('minBox').addEventListener('input', () => scheduleRender(120));
   $('minBox').addEventListener('change', () => { commitHistoryEdit(); render(); });
   $('minRibbon').addEventListener('input', () => scheduleRender(120));
@@ -347,6 +364,12 @@ function init() {
   $('showBalance').addEventListener('input', () => { commitHistoryEdit(); render(); });
   $('showVotes').addEventListener('input', () => { commitHistoryEdit(); render(); });
   $('provinceFilter').addEventListener('input', () => { commitHistoryEdit(); render(); });
+  $('modelSwitch').addEventListener('input', () => {
+    commitHistoryEdit();
+    state.model = $('modelSwitch').value || "";
+    closeMap();
+    render();
+  });
   $('shareView').addEventListener('click', shareView);
   $('shareMap').addEventListener('click', shareMap);
   $('hoverInfo').addEventListener('click', event => {
@@ -375,6 +398,9 @@ function init() {
   });
   $('chart').addEventListener('contextmenu', event => event.preventDefault());
   $('chart').addEventListener('selectstart', event => event.preventDefault());
+  if (DEBUG) {
+    loadPairErrors().then(() => render()).catch(error => console.warn(error));
+  }
   window.addEventListener('resize', () => {
     window.clearTimeout(resizeTimer);
     resizeTimer = window.setTimeout(() => {
@@ -398,9 +424,41 @@ function init() {
   });
   render();
 }
+async function loadPairErrors() {
+  if (!DATA.pair_error_file) return {};
+  if (DATA.pair_errors) return DATA.pair_errors;
+  if (!pairErrorsPromise) {
+    pairErrorsPromise = fetch(DATA.pair_error_file).then(async response => {
+      if (!response.ok) throw new Error(`failed to load ${DATA.pair_error_file}`);
+      DATA.pair_errors = decodePairErrorsBinary(await response.arrayBuffer());
+      return DATA.pair_errors;
+    });
+  }
+  return pairErrorsPromise;
+}
 function renderProvinceOptions() {
   const provinces = DATA.provinces || [];
   $('provinceFilter').innerHTML = `<option value="">Türkiye</option>${provinces.map(il => `<option value="${attr(il)}">${text(il)}</option>`).join("")}`;
+}
+function availableModels() {
+  const models = new Set();
+  Object.values(DATA.flow_files || {}).forEach(files => {
+    Object.keys(files || {}).forEach(model => models.add(model));
+  });
+  const priority = DATA.model_priority || DEFAULT_MODEL_PRIORITY;
+  return priority
+    .filter(model => models.has(model))
+    .concat([...models].filter(model => !priority.includes(model)).sort());
+}
+function renderModelOptions() {
+  const models = availableModels();
+  state.model = models.includes(state.model) ? state.model : (models[0] || "");
+  $('modelSwitch').innerHTML = models.map(model => `<option value="${attr(model)}">${text(MODEL_LABELS[model] || model)}</option>`).join("");
+  $('modelSwitch').value = state.model;
+}
+function modelFromControls(model) {
+  const models = availableModels();
+  return DEBUG && model && models.includes(model) ? model : models[0] || "";
 }
 function newStage(key) {
   const id = `stage_${++uid}`;
@@ -435,6 +493,7 @@ function setDefaultControls() {
   $('showBalance').checked = DEFAULT_SHOW_BALANCE;
   $('showVotes').checked = false;
   $('provinceFilter').value = "";
+  $('modelSwitch').value = state.model || availableModels()[0] || "";
 }
 function controlSnapshot() {
   return {
@@ -444,6 +503,7 @@ function controlSnapshot() {
     showBalance: !!$('showBalance')?.checked,
     showVotes: !!$('showVotes')?.checked,
     provinceFilter: $('provinceFilter')?.value || "",
+    modelSwitch: $('modelSwitch')?.value || "",
   };
 }
 function restoreControls(controls = {}) {
@@ -453,9 +513,14 @@ function restoreControls(controls = {}) {
   if ($('showBalance')) $('showBalance').checked = "showBalance" in controls ? !!controls.showBalance : DEFAULT_SHOW_BALANCE;
   if ($('showVotes')) $('showVotes').checked = !!controls.showVotes;
   if ($('provinceFilter')) $('provinceFilter').value = controls.provinceFilter || "";
+  if ($('modelSwitch')) {
+    const model = modelFromControls(controls.modelSwitch);
+    state.model = model;
+    $('modelSwitch').value = model;
+  }
 }
 function historySnapshot() {
-  return JSON.stringify({stages: state.stages, rows: state.rows, sortMode: state.sortMode, colors: state.colors, selectedStageId, controls: controlSnapshot()});
+  return JSON.stringify({stages: state.stages, rows: state.rows, sortMode: state.sortMode, colors: state.colors, model: state.model, selectedStageId, controls: controlSnapshot()});
 }
 function restoreHistorySnapshot(item) {
   const old = JSON.parse(item);
@@ -464,8 +529,9 @@ function restoreHistorySnapshot(item) {
   Object.assign(state.rows, old.rows);
   state.sortMode = old.sortMode || "vote";
   state.colors = old.colors || {};
+  if (DEBUG && typeof old.model === "string") state.model = old.model;
   selectedStageId = old.selectedStageId;
-  restoreControls(old.controls);
+  restoreControls({...old.controls, modelSwitch: old.controls?.modelSwitch || old.model});
 }
 function updateHistoryButtons() {
   const undoButton = $('undo');
@@ -550,6 +616,7 @@ function encodeShareState() {
     bal: $('showBalance').checked,
     votes: $('showVotes').checked,
     il: $('provinceFilter').value || "",
+    model: $('modelSwitch').value || state.model || "",
     c: state.colors,
     map: encodeMapShareState(),
   };
@@ -659,6 +726,10 @@ function loadSharedView() {
     $('showVotes').checked = !!payload.votes;
     state.colors = payload.c && typeof payload.c === "object" ? payload.c : {};
     if (payload.il && (DATA.provinces || []).includes(payload.il)) $('provinceFilter').value = payload.il;
+    if (DEBUG && typeof payload.model === "string" && availableModels().includes(payload.model)) {
+      state.model = payload.model;
+      $('modelSwitch').value = payload.model;
+    }
     pendingShareMapState = payload.map && typeof payload.map === "object" ? payload.map : null;
     return true;
   } catch (error) {
@@ -960,6 +1031,7 @@ function bestModelForPair(pairKey) {
   const summary = DATA.cv_summaries[pairKey] || [];
   const model = summary[0]?.model;
   const files = DATA.flow_files?.[pairKey] || {};
+  if (state.model && files[state.model]) return state.model;
   for (const priorityModel of DATA.model_priority || DEFAULT_MODEL_PRIORITY) {
     if (files[priorityModel]) return priorityModel;
   }
@@ -2049,11 +2121,7 @@ function updateMapMetricControls(context) {
 function renderMap(context, geometry, provinceGeometry, rows, metric = "count") {
   const svg = $('mapChart');
   const allPoints = geometry.features.flatMap(feature => featureCoordinates(feature.geometry));
-  const latitudes = allPoints.map(point => point[1]);
-  const midLatitude = (Math.min(...latitudes) + Math.max(...latitudes)) / 2;
-  const longitudeScale = Math.cos(midLatitude * Math.PI / 180);
-  const projectedX = point => point[0] * longitudeScale;
-  const xs = allPoints.map(projectedX);
+  const xs = allPoints.map(point => point[0]);
   const ys = allPoints.map(point => point[1]);
   const minX = Math.min(...xs), maxX = Math.max(...xs);
   const minY = Math.min(...ys), maxY = Math.max(...ys);
@@ -2061,12 +2129,11 @@ function renderMap(context, geometry, provinceGeometry, rows, metric = "count") 
   const box = svg.getBoundingClientRect();
   const width = Math.max(box.width || svg.clientWidth || 760, 320);
   const height = Math.max(box.height || svg.clientHeight || 520, 80);
-  svg.setAttribute("preserveAspectRatio", "xMidYMid meet");
   svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
   const pad = 14;
   const scale = Math.min((width - pad * 2) / (maxX - minX), (height - pad * 2) / (maxY - minY));
   const project = point => [
-    pad + (projectedX(point) - minX) * scale,
+    pad + (point[0] - minX) * scale,
     height - pad - (point[1] - minY) * scale,
   ];
   const values = new Map(rows.map(row => [districtKey(row.il, row.ilce), row.value]));
@@ -2217,14 +2284,35 @@ function draw(rawLinks, baselineLinks = rawLinks, standaloneNodes = []) {
     if (isBalanceParty(node.party)) return;
     displayStageTotals.set(node.stageId, (displayStageTotals.get(node.stageId) || 0) + value);
   });
-  const stageLabels = state.stages.map(stage => {
+  const stageLabelBoxes = new Map();
+  state.stages.forEach(stage => {
     const stageNodes = [...g.pos.values()].filter(n => n.stageId === stage.id);
-    if (!stageNodes.length) return "";
+    if (!stageNodes.length) return;
     const minX = Math.min(...stageNodes.map(n => n.x));
     const minY = Math.min(...stageNodes.map(n => n.y));
     const maxY = Math.max(...stageNodes.map(n => n.y + n.h));
-    return stageLabelSvg(stage.key, minX - 30, minY, maxY - minY);
+    stageLabelBoxes.set(stage.id, {x: minX - 30, y: minY, h: maxY - minY});
+  });
+  const stageLabels = state.stages.map(stage => {
+    const box = stageLabelBoxes.get(stage.id);
+    return box ? stageLabelSvg(shortStageCode(stage.key), box.x, box.y, box.h) : "";
   }).join('');
+  const stageErrors = DEBUG ? state.stages.slice(1).map((stage, index) => {
+    const previous = state.stages[index];
+    const previousBox = stageLabelBoxes.get(previous.id);
+    const box = stageLabelBoxes.get(stage.id);
+    if (!previousBox || !box) return "";
+    const model = bestModelForPair(`${previous.key}__to__${stage.key}`);
+    const error = pairErrorLabel(`${previous.key}__to__${stage.key}`, model);
+    if (!error) return "";
+    const gapTop = previousBox.y + previousBox.h;
+    const gapBottom = box.y;
+    const centerY = ((previousBox.y + previousBox.h / 2) + (box.y + box.h / 2)) / 2;
+    const availableH = Math.max(0, gapBottom - gapTop - 10);
+    const h = Math.max(38, Math.min(64, availableH || 48));
+    const x = Math.min(previousBox.x, box.x);
+    return stageErrorSvg(error, x, centerY - h / 2, h);
+  }).join('') : '';
   const orderedLinks = g.links.slice().sort((a, b) => {
     const as = g.pos.get(a.source_node_id);
     const bs = g.pos.get(b.source_node_id);
@@ -2351,7 +2439,7 @@ function draw(rawLinks, baselineLinks = rawLinks, standaloneNodes = []) {
   const defs = defsContent
     ? `<defs>${defsContent}</defs>`
     : '';
-  svg.innerHTML = `${defs}${stageLabels}${paths}${nodes}`;
+  svg.innerHTML = `${defs}${stageLabels}${stageErrors}${paths}${nodes}`;
   [...svg.querySelectorAll('[data-hover]')].forEach(item => {
     const mapContext = () => {
       if (item.classList.contains('link')) return mapContextForLink(orderedLinks[+item.dataset.linkIndex]);
